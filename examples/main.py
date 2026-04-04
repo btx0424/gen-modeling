@@ -1,366 +1,428 @@
-# %%
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
-import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.datasets import make_swiss_roll, make_moons
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-from typing import Literal
 
-torch.set_float32_matmul_precision('high')
+from gen_modeling.datasets.synthetic import MoonsDataset, SwissRollDataset
 
-# ==========================================
-# 1. Configuration
-# ==========================================
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SEED = 42
-torch.manual_seed(SEED)
-np.random.seed(SEED)
+torch.set_float32_matmul_precision("high")
 
-INTRINSIC_DIM = 2      # true manifold dimension
-AMBIENT_DIM = 32      # high-dimensional ambient space
-
-print(f"Running on {DEVICE} with Ambient Dimension D={AMBIENT_DIM}")
-
-# %%
-# ==========================================
-# 2. Data + Random Orthogonal Embedding
-# ==========================================
-def get_data(batch_size: int, data_type: str) -> np.ndarray:
-    if data_type == "swiss_roll":
-        data, _ = make_swiss_roll(batch_size)
-        data = data[:, [0, 2]] / 10.0
-    elif data_type == "moons":
-        data, _ = make_moons(batch_size)
-    return data
-
-# random orthogonal projection 2 → D
-Q = torch.randn(AMBIENT_DIM, INTRINSIC_DIM, device=DEVICE)
-Q, _ = torch.linalg.qr(Q)
-
-def embed(x2d):
-    return x2d @ Q.T
-
-def project_back(xD):
-    return xD @ Q
-
-n_points = 8192
-data_type = "swiss_roll"
-data = get_data(n_points, data_type)
-
-plt.scatter(data[:,0], data[:,1], s=5, c='black', alpha=0.5)
-plt.tight_layout()
-plt.show()
-
-# %%
-batch_size = 1024
-dataset = torch.from_numpy(data).float().to(DEVICE)
-dataset = TensorDataset(dataset) 
-# dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=8, prefetch_factor=4)
-dataloader = DataLoader(dataset, batch_size=batch_size)
-
-# %%
-# ==========================================
-# 3. Model (MLP)
-# ==========================================
-class DenoisingMLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.time_encoder = nn.Sequential(
-            nn.Linear(1, 20),
-            nn.ReLU(),
-        )
-
-        self.net = nn.Sequential(
-            nn.Linear(dim + 20, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, dim),
-        )
-
-    def forward(self, z_t, t):
-        t_emb = self.time_encoder(t)
-        out = self.net(torch.cat((z_t, t_emb), dim=-1))
-        return out
+PredictionType = Literal["x", "eps", "v"]
+LossType = Literal["x", "eps", "v"]
+ModelArch = Literal[
+    "vanilla",
+    "global_residual",
+    "corrected_residual1",
+    "corrected_residual2",
+]
 
 
-class MLPGlobalResidual(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.time_encoder = nn.Sequential(
-            nn.Linear(1, 20),
-            nn.ReLU(),
-        )
-
-        self.net = nn.Sequential(
-            nn.Linear(dim + 20, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, dim),
-        )
-
-    def forward(self, z_t, t):
-        t_emb = self.time_encoder(t)
-        out = self.net(torch.cat((z_t, t_emb), dim=-1))
-        return out + z_t
+@dataclass(frozen=True)
+class Config:
+    seed: int = 42
+    ambient_dim: int = 32
+    n_points: int = 8192
+    batch_size: int = 1024
+    data_type: Literal["swiss_roll", "moons"] = "swiss_roll"
+    loss_type: LossType = "x"
+    train_steps: int = 500
+    hidden_dim: int = 256
+    t_eps: float = 1e-2
+    sample_steps: int = 50
+    output_path: str = "assets/residual.png"
+    experiment_output_dir: str = "assets/residual_experiments"
 
 
-class MLPCorrectedResidual1(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.time_encoder = nn.Sequential(
-            nn.Linear(1, 20),
-            nn.ReLU(),
-        )
-
-        self.net = nn.Sequential(
-            nn.Linear(dim + 20, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, dim),
-        )
-
-    def forward(self, z_t, t):
-        t_emb = self.time_encoder(t)
-        out = self.net(torch.cat((z_t, t_emb), dim=-1))
-        return out + z_t/ (1 - t)
+@dataclass(frozen=True)
+class DataBundle:
+    data_ambient: torch.Tensor
+    dataloader: DataLoader
+    projection: torch.Tensor
 
 
-class MLPCorrectedResidual2(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.time_encoder = nn.Sequential(
-            nn.Linear(1, 20),
-            nn.ReLU(),
-        )
-
-        self.net = nn.Sequential(
-            nn.Linear(dim + 20, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, dim),
-        )
-
-    def forward(self, z_t, t):
-        t_emb = self.time_encoder(t)
-        out = self.net(torch.cat((z_t, t_emb), dim=-1))
-        return (t * out + z_t) / (1 - t)
+@dataclass
+class ExperimentResult:
+    model: nn.Module
+    losses: list[float]
+    samples_ambient: torch.Tensor
 
 
-
-# %%
-# ==================================================
-# 4. Loss (x, eps, v prediction) * (x, eps, v loss)
-# ==================================================
-def compute_loss(x1, eps, xt, t, pred_raw, pred_type, loss_type):
-    if loss_type == "v":
-        if pred_type == "x":
-            x1_hat = pred_raw
-            v_hat = (x1_hat - xt) / (1-t)
-        elif pred_type == "eps":
-            eps_hat = pred_raw
-            v_hat = (xt - eps_hat) / t
-        elif pred_type == "v":
-            v_hat = pred_raw
-        v_target = x1 - eps
-        return ((v_hat - v_target)**2).mean()
-    
-    elif loss_type == "x":
-        if pred_type == "x":
-            x1_hat = pred_raw
-        elif pred_type == "eps":
-            eps_hat = pred_raw
-            x1_hat = (xt - eps_hat*(1-t)) / t
-        elif pred_type == "v":
-            v_hat = pred_raw
-            x1_hat = xt + (1 - t) * v_hat
-        return ((x1_hat - x1)**2).mean()
-
-    elif loss_type == "eps":
-        if pred_type == "x":
-            x1_hat = pred_raw
-            eps_hat = (xt - t*x1_hat) / (1 - t)
-        elif pred_type == "eps":
-            eps_hat = pred_raw
-        elif pred_type == "v":
-            v_hat = pred_raw
-            eps_hat = xt - t * v_hat
-        return ((eps_hat - eps)**2).mean()
-
-# %%
-# ==========================================
-# 5. Training (x, eps, v prediction)
-# ==========================================
-def train_model(pred_type="x", loss_type="v", model_arch: Literal["vanilla", "global_residual", "corrected_residual1", "corrected_residual2"] = "vanilla", hidden_dim=256, train_steps=1000):
-    assert pred_type in ["x", "eps", "v"]
-    assert loss_type in ["x", "eps", "v"]
-    model_cls = {
-        "vanilla": DenoisingMLP,
-        "global_residual": MLPGlobalResidual,
-        "corrected_residual1": MLPCorrectedResidual1,
-        "corrected_residual2": MLPCorrectedResidual2,
-    }[model_arch]
-    model = model_cls(AMBIENT_DIM, hidden_dim).to(DEVICE)
-    optim_ = optim.Adam(model.parameters(), lr=1e-3)
-
-    print(f"Training {pred_type}-prediction {model_arch} model with {loss_type} loss...")
-    t_eps = 1e-2
-    losses = []
-
-    @torch.compile(mode="max-autotune", disable=True)
-    def train_step(x1_low):
-        x1 = embed(x1_low)
-        eps = torch.randn_like(x1)
-        t = torch.rand((x1.shape[0], 1), device=DEVICE)
-        t = t.clip(t_eps, 1 - t_eps)
-        xt = t * x1 + (1 - t) * eps
-
-        pred_raw = model(xt, t)
-        
-        loss = compute_loss(x1, eps, xt, t, pred_raw, pred_type, loss_type)
-        optim_.zero_grad()
-        loss.backward()
-        optim_.step()
-
-        return loss
-
-    pbar = tqdm(range(train_steps))
-    for step in pbar:
-        for batch in dataloader:
-            x1_low = batch[0].to(DEVICE, non_blocking=True)
-            loss = train_step(x1_low)
-            losses.append(loss.clone().detach())
-            pbar.set_postfix(loss=loss.item())
-
-    losses = [loss.item() for loss in losses]
-    return model, losses
-
-LOSS_TYPE = "v"   # v, x, eps
-TRAIN_STEPS = 1000
-HIDDEN_DIM = 256
-
-experiments = [
+DEFAULT_EXPERIMENTS: list[tuple[ModelArch, PredictionType]] = [
     ("vanilla", "x"),
     ("vanilla", "eps"),
     ("vanilla", "v"),
     ("global_residual", "x"),
     ("global_residual", "eps"),
     ("global_residual", "v"),
-    ("corrected_residual1", "x"),
-    ("corrected_residual1", "eps"),
-    ("corrected_residual1", "v"),
     ("corrected_residual2", "x"),
     ("corrected_residual2", "eps"),
     ("corrected_residual2", "v"),
 ]
 
-results = {}
 
-for model_arch, pred_type in experiments:
-    model, losses = train_model(model_arch=model_arch, pred_type=pred_type, loss_type=LOSS_TYPE, hidden_dim=HIDDEN_DIM, train_steps=TRAIN_STEPS)
-    results[(model_arch, pred_type)] = (model, losses)
+def project_to_intrinsic(x_ambient: torch.Tensor, projection: torch.Tensor) -> torch.Tensor:
+    return x_ambient @ projection
 
-# %%
-# Visualize the training loss curves
-plt.figure(figsize=(10, 6))
-for (model_arch, pred_type), (_, losses) in results.items():
-    plt.plot(losses, label=f"{model_arch} - {pred_type}")
-plt.ylabel("Loss")
-plt.title("Training Loss Curves")
-plt.ylim(0, 2)
-plt.legend()
-plt.grid(True)
-plt.show()
 
-# %%
-# ==========================================
-# 6. Sampling
-# ==========================================
-@torch.no_grad()
-def sample(model, pred_type, num_samples=2000, steps=50):
-    x_t = torch.randn(num_samples, AMBIENT_DIM, device=DEVICE)
-    eps_t = 1e-2
-    ts = torch.linspace(eps_t, 1 - eps_t, steps, device=DEVICE)
-    ts = ts.unsqueeze(0).repeat(num_samples, 1)
-    interval = ts[:, 1:2] - ts[:, 0:1]
+def intrinsic_dim(projection: torch.Tensor) -> int:
+    return int(projection.shape[1])
 
-    for i in range(steps):
-        t = ts[:, i:i+1]
-        pred_raw = model(x_t, t)
 
-        if pred_type == "x":
-            x1_hat = pred_raw
-            v_hat = (x1_hat - x_t) / (1-t)
-        elif pred_type == "eps":
-            eps_hat = pred_raw
+def prepare_data(config: Config, device: torch.device) -> DataBundle:
+    dataset_cls = {
+        "swiss_roll": SwissRollDataset,
+        "moons": MoonsDataset,
+    }[config.data_type]
+    dataset = dataset_cls(
+        ambient_dim=config.ambient_dim,
+        n_samples=config.n_points,
+        noise=0.05,
+        device=str(device),
+        random_state=config.seed,
+    )
+    dataloader = DataLoader(dataset, batch_size=config.batch_size)
+    return DataBundle(
+        data_ambient=dataset.data,
+        dataloader=dataloader,
+        projection=dataset.Q,
+    )
+
+
+class DenoisingMLP(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        activation: nn.Module = nn.ReLU
+    ):
+        super().__init__()
+        self.time_encoder = nn.Sequential(
+            nn.Linear(1, 20),
+            activation(),
+        )
+        self.net = nn.Sequential(
+            nn.Linear(dim + 20, hidden_dim),
+            activation(),
+            nn.Linear(hidden_dim, hidden_dim),
+            activation(),
+            nn.Linear(hidden_dim, hidden_dim),
+            activation(),
+            nn.Linear(hidden_dim, hidden_dim),
+            activation(),
+            nn.Linear(hidden_dim, dim),
+        )
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        t_emb = self.time_encoder(t)
+        return self.net(torch.cat((x_t, t_emb), dim=-1))
+
+
+class PredictionWrapper(nn.Module):
+    def __init__(self, network: nn.Module, pred_type: PredictionType):
+        super().__init__()
+        self.network = network
+        self.pred_type = pred_type
+
+    def reparameterize(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        pred = self.reparameterize(x_t, t)
+        if self.pred_type == "x":
+            x1_hat = pred
+            v_hat = (x1_hat - x_t) / (1.0 - t)
+            eps_hat = (x_t - t * x1_hat) / (1.0 - t)
+        elif self.pred_type == "eps":
+            eps_hat = pred
             v_hat = (x_t - eps_hat) / t
-        elif pred_type == "v":
-            v_hat = pred_raw
-        x_t = x_t + v_hat * interval
+            x1_hat = x_t + (1.0 - t) * v_hat
+        else:
+            v_hat = pred
+            x1_hat = x_t + (1.0 - t) * v_hat
+            eps_hat = x_t - t * v_hat
+        return x1_hat, v_hat, eps_hat
 
+
+class VanillaWrapper(PredictionWrapper):
+    def reparameterize(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return self.network(x_t, t)
+
+
+class GlobalResidualWrapper(PredictionWrapper):
+    def reparameterize(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return self.network(x_t, t) + x_t
+
+
+class CorrectedResidual1Wrapper(PredictionWrapper):
+    def reparameterize(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return self.network(x_t, t) + x_t / (1.0 - t)
+
+
+class CorrectedResidual2Wrapper(PredictionWrapper):
+    def reparameterize(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        raw_pred = self.network(x_t, t)
+        return (t * raw_pred + x_t) / (1.0 - t)
+
+
+def build_model(
+    model_arch: ModelArch,
+    pred_type: PredictionType,
+    ambient_dim: int,
+    hidden_dim: int,
+    device: torch.device,
+) -> nn.Module:
+    base_network = DenoisingMLP(ambient_dim, hidden_dim)
+    wrapper_cls = {
+        "vanilla": VanillaWrapper,
+        "global_residual": GlobalResidualWrapper,
+        "corrected_residual1": CorrectedResidual1Wrapper,
+        "corrected_residual2": CorrectedResidual2Wrapper,
+    }[model_arch]
+    return wrapper_cls(base_network, pred_type).to(device)
+
+
+def compute_loss(
+    loss_type: LossType,
+    x1: torch.Tensor,
+    eps: torch.Tensor,
+    predictions: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    x1_hat, v_hat, eps_hat = predictions
+    if loss_type == "x":
+        return ((x1_hat - x1) ** 2).mean()
+    if loss_type == "eps":
+        return ((eps_hat - eps) ** 2).mean()
+    if loss_type == "v":
+        v_target = x1 - eps
+        return ((v_hat - v_target) ** 2).mean()
+    raise ValueError(f"Invalid loss type: {loss_type}")
+
+
+def train_model(
+    config: Config,
+    data_bundle: DataBundle,
+    device: torch.device,
+    model_arch: ModelArch,
+    pred_type: PredictionType,
+) -> tuple[nn.Module, list[float]]:
+    model = build_model(model_arch, pred_type, config.ambient_dim, config.hidden_dim, device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    losses: list[float] = []
+
+    @torch.compile(mode="max-autotune", disable=True)
+    def train_step(x1: torch.Tensor) -> torch.Tensor:
+        eps = torch.randn_like(x1)
+        t = torch.rand((x1.shape[0], 1), device=device).clip(config.t_eps, 1.0 - config.t_eps)
+        x_t = t * x1 + (1.0 - t) * eps
+        predictions = model(x_t, t)
+        loss = compute_loss(config.loss_type, x1, eps, predictions)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        return loss
+
+    print(f"Training {pred_type}-prediction {model_arch} model with {config.loss_type} loss...")
+    progress = tqdm(range(config.train_steps))
+    for _ in progress:
+        for x1, _ in data_bundle.dataloader:
+            x1 = x1.to(device, non_blocking=True)
+            loss = train_step(x1)
+            losses.append(loss.detach().item())
+            progress.set_postfix(loss=loss.item())
+
+    return model, losses
+
+
+@torch.no_grad()
+def sample_model(
+    model: nn.Module,
+    config: Config,
+    device: torch.device,
+    num_samples: int,
+) -> torch.Tensor:
+    x_t = torch.randn(num_samples, config.ambient_dim, device=device)
+    ts = torch.linspace(config.t_eps, 1.0 - config.t_eps, config.sample_steps, device=device)
+    dt = ts[1] - ts[0] if config.sample_steps > 1 else torch.tensor(1.0 - 2 * config.t_eps, device=device)
+    for t_scalar in ts:
+        t = torch.full((num_samples, 1), t_scalar.item(), device=device)
+        _, v_hat, _ = model(x_t, t)
+        x_t = x_t + v_hat * dt
     return x_t
 
 
-samples = {}
-for (model_arch, pred_type), (model, _) in results.items():
-    samples[(model_arch, pred_type)] = sample(model, pred_type, num_samples=n_points)
+def plot_intrinsic_scatter(
+    ax: plt.Axes,
+    data_intrinsic: np.ndarray,
+    samples_intrinsic: np.ndarray | None = None,
+    *,
+    title: str | None = None,
+) -> None:
+    dim = data_intrinsic.shape[1]
+    if dim == 2:
+        ax.scatter(data_intrinsic[:, 0], data_intrinsic[:, 1], s=5, c="black", alpha=0.2, label="data")
+        if samples_intrinsic is not None:
+            ax.scatter(samples_intrinsic[:, 0], samples_intrinsic[:, 1], s=5, alpha=0.35, label="generated")
+        ax.set_xlim(-1.5, 1.5)
+        ax.set_ylim(-1.5, 1.5)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel(r"$z_1$")
+        ax.set_ylabel(r"$z_2$")
+    elif dim == 3:
+        ax.scatter(
+            data_intrinsic[:, 0],
+            data_intrinsic[:, 1],
+            data_intrinsic[:, 2],
+            s=4,
+            c="black",
+            alpha=0.15,
+            label="data",
+            depthshade=False,
+        )
+        if samples_intrinsic is not None:
+            ax.scatter(
+                samples_intrinsic[:, 0],
+                samples_intrinsic[:, 1],
+                samples_intrinsic[:, 2],
+                s=4,
+                alpha=0.35,
+                label="generated",
+                depthshade=False,
+            )
+        ax.set_xlabel(r"$z_1$")
+        ax.set_ylabel(r"$z_2$")
+        ax.set_zlabel(r"$z_3$")
+    else:
+        raise ValueError(f"Plotting supports intrinsic dim 2 or 3, got {dim}")
 
-# Project back to 2D
-x_orig = data
-x_preds = {}
-for (model_arch, pred_type), sample in samples.items():
-    x_preds[(model_arch, pred_type)] = project_back(sample).cpu().numpy()
-
-# %%
-# ==========================================
-# 7. Plot
-# ==========================================
-
-model_arches = list(dict.fromkeys([arch for arch, _ in experiments]))
-cols = ["original", "x", "eps", "v"]
-
-fig, axes = plt.subplots(len(model_arches), len(cols), figsize=(20, 5 * len(model_arches)))
-
-if len(model_arches) == 1:
-    axes = axes[None, :]  # ensure 2D indexing even for a single row
-
-for row_idx, model_arch in enumerate(model_arches):
-    axes[row_idx, 0].scatter(x_orig[:, 0], x_orig[:, 1], s=5, c="black", alpha=0.5)
-    axes[row_idx, 0].set_title(f"{model_arch} - Ground Truth")
-
-    for col_idx, pred_type in enumerate(["x", "eps", "v"], start=1):
-        x_pred = x_preds[(model_arch, pred_type)]
-        axes[row_idx, col_idx].scatter(x_pred[:, 0], x_pred[:, 1], s=5, alpha=0.5)
-        axes[row_idx, col_idx].set_title(f"{model_arch} - {pred_type}")
-
-for ax in axes.flat:
-    ax.set_xlim(-1.5, 1.5)
-    ax.set_ylim(-1.5, 1.5)
-
-plt.tight_layout()
-plt.savefig("assets/residual.png")
+    if title is not None:
+        ax.set_title(title)
+    if samples_intrinsic is not None:
+        ax.legend(loc="best")
 
 
+def plot_data(data_ambient: torch.Tensor, projection: torch.Tensor) -> None:
+    data_intrinsic = project_to_intrinsic(data_ambient, projection).detach().cpu().numpy()
+    dim = intrinsic_dim(projection)
+    fig = plt.figure(figsize=(7.5, 6.5) if dim == 3 else (6, 6))
+    ax = fig.add_subplot(111, projection="3d" if dim == 3 else None)
+    plot_intrinsic_scatter(ax, data_intrinsic, title="Ground Truth")
+    plt.tight_layout()
+    plt.show()
 
+
+def plot_training_curves(results: dict[tuple[ModelArch, PredictionType], ExperimentResult]) -> None:
+    plt.figure(figsize=(10, 6))
+    for (model_arch, pred_type), result in results.items():
+        plt.plot(result.losses, label=f"{model_arch} - {pred_type}")
+    plt.ylabel("Loss")
+    plt.title("Training Loss Curves")
+    plt.ylim(0, 2)
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+def save_experiment_visualizations(
+    config: Config,
+    data_bundle: DataBundle,
+    results: dict[tuple[ModelArch, PredictionType], ExperimentResult],
+) -> None:
+    output_dir = Path(config.experiment_output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    data_intrinsic = project_to_intrinsic(data_bundle.data_ambient, data_bundle.projection).detach().cpu().numpy()
+
+    for (model_arch, pred_type), result in results.items():
+        samples_intrinsic = project_to_intrinsic(result.samples_ambient, data_bundle.projection).detach().cpu().numpy()
+        dim = intrinsic_dim(data_bundle.projection)
+        fig = plt.figure(figsize=(7.5, 6.5) if dim == 3 else (6.5, 6.5))
+        ax = fig.add_subplot(111, projection="3d" if dim == 3 else None)
+        plot_intrinsic_scatter(
+            ax,
+            data_intrinsic,
+            samples_intrinsic,
+            title=f"{model_arch} - {pred_type} ({config.loss_type} loss)",
+        )
+        fig.tight_layout()
+        fig.savefig(output_dir / f"{model_arch}_{pred_type}_{config.loss_type}.png", dpi=150)
+        plt.close(fig)
+
+
+def plot_samples(
+    config: Config,
+    data_bundle: DataBundle,
+    results: dict[tuple[ModelArch, PredictionType], ExperimentResult],
+    experiments: list[tuple[ModelArch, PredictionType]],
+) -> None:
+    x_preds = {
+        key: project_to_intrinsic(result.samples_ambient, data_bundle.projection).detach().cpu().numpy()
+        for key, result in results.items()
+    }
+    data_intrinsic = project_to_intrinsic(data_bundle.data_ambient, data_bundle.projection).detach().cpu().numpy()
+    model_arches = list(dict.fromkeys([arch for arch, _ in experiments]))
+    cols = ["original", "x", "eps", "v"]
+    dim = intrinsic_dim(data_bundle.projection)
+    fig = plt.figure(figsize=(24, 6 * len(model_arches) if dim == 3 else 5 * len(model_arches)))
+    axes: list[list[plt.Axes]] = []
+    for row_idx in range(len(model_arches)):
+        row_axes: list[plt.Axes] = []
+        for col_idx in range(len(cols)):
+            subplot_index = row_idx * len(cols) + col_idx + 1
+            row_axes.append(fig.add_subplot(len(model_arches), len(cols), subplot_index, projection="3d" if dim == 3 else None))
+        axes.append(row_axes)
+
+    for row_idx, model_arch in enumerate(model_arches):
+        plot_intrinsic_scatter(axes[row_idx][0], data_intrinsic, title=f"{model_arch} - Ground Truth")
+        for col_idx, pred_type in enumerate(["x", "eps", "v"], start=1):
+            key = (model_arch, pred_type)
+            if key not in x_preds:
+                axes[row_idx][col_idx].set_axis_off()
+                continue
+            plot_intrinsic_scatter(
+                axes[row_idx][col_idx],
+                data_intrinsic,
+                x_preds[key],
+                title=f"{model_arch} - {pred_type}",
+            )
+
+    plt.tight_layout()
+    output_path = Path(config.output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path)
+
+
+def main() -> None:
+    config = Config()
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    torch.manual_seed(config.seed)
+    np.random.seed(config.seed)
+    
+    print(f"Running on {device} with Ambient Dimension D={config.ambient_dim}")
+
+    data_bundle = prepare_data(config, device)
+    plot_data(data_bundle.data_ambient, data_bundle.projection)
+
+    results: dict[tuple[ModelArch, PredictionType], ExperimentResult] = {}
+    for model_arch, pred_type in DEFAULT_EXPERIMENTS:
+        model, losses = train_model(config, data_bundle, device, model_arch, pred_type)
+        samples_ambient = sample_model(model, config, device, num_samples=config.n_points)
+        results[(model_arch, pred_type)] = ExperimentResult(
+            model=model,
+            losses=losses,
+            samples_ambient=samples_ambient,
+        )
+    
+    plot_training_curves(results)
+    save_experiment_visualizations(config, data_bundle, results)
+    plot_samples(config, data_bundle, results, DEFAULT_EXPERIMENTS)
+
+
+if __name__ == "__main__":
+    main()

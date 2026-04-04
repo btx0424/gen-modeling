@@ -31,7 +31,7 @@ class SwissRollDataset(Dataset):
             random_state=random_state,
             hole=hole,
         )
-        z = torch.as_tensor(z_np, dtype=torch.float32)
+        z = torch.as_tensor(z_np, dtype=torch.float32) / 10.0
         self.Q = torch.randn(ambient_dim, self.intrinsic_dim, dtype=torch.float32)
         self.Q, _ = torch.linalg.qr(self.Q)
         self.Q = self.Q.to(device)

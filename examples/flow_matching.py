@@ -36,8 +36,6 @@ class NetworkND(nn.Module):
         for _ in range(num_layers):
             layers.append(nn.SiLU())
             layers.append(nn.Linear(hidden_dim, hidden_dim))
-        layers.append(nn.SiLU())
-        layers.append(nn.Linear(hidden_dim, input_dim))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -109,7 +107,7 @@ class XPrediction(nn.Module):
         raw_pred = self.network(x_t, t)
         x1_hat = raw_pred
         v_hat = (x1_hat - x_t) / (1.0 - t)
-        eps_hat = (x_t - t * v_hat) / (1.0 - t)
+        eps_hat = x_t - t * v_hat
         return x1_hat, v_hat, eps_hat
 
 
@@ -134,12 +132,14 @@ class LinearFlow:
 
     @torch.no_grad()
     def sample(self, num_samples: int, num_steps: int) -> torch.Tensor:
-        """Integrate dx/dt = v(x, t) from t=0 (noise) to t=1 (data), matching the training path."""
+        """Integrate dx/dt = v(x, t) over the same clipped time range used in training."""
         device = next(self.pred_module.parameters()).device
         x = torch.randn((num_samples,) + self.sample_shape, device=device) * self.noise_scale
-        dt = 1.0 / num_steps
-        for i in range(num_steps):
-            t = torch.full((num_samples,), i * dt, device=device)
+        eps_t = 1e-2
+        ts = torch.linspace(eps_t, 1.0 - eps_t, num_steps, device=device)
+        dt = ts[1] - ts[0] if num_steps > 1 else torch.tensor(1.0 - 2 * eps_t, device=device)
+        for t_scalar in ts:
+            t = torch.full((num_samples,), t_scalar.item(), device=device)
             _, v_hat, _ = self.pred_module(x, t)
             x = x + v_hat * dt
         return x
@@ -149,7 +149,7 @@ class LinearFlow:
         t = torch.rand(x_1.shape[0], device=x_1.device, dtype=x_1.dtype)
         t = t.clip(1e-2, 1 - 1e-2)
         t = t.reshape(expand_shape)
-        x_0 = torch.randn_like(x_1)
+        x_0 = torch.randn_like(x_1) * self.noise_scale
         x_t = t * x_1 + (1.0 - t) * x_0
 
         if self.loss_type == "v":
@@ -166,10 +166,10 @@ class LinearFlow:
             raise ValueError(f"Invalid loss type: {self.loss_type}")
 
 
-DATASETS = {
-    "swiss_roll": SwissRollDataset(ambient_dim=64, n_samples=10_000, noise=0.05),
-    "moons": MoonsDataset(ambient_dim=64, n_samples=10_000, noise=0.05),
-    # "mnist": MNIST(root="data", train=True, transform=ToTensor(), download=True),
+DATASET_CLASSES = {
+    "swiss_roll": SwissRollDataset,
+    "moons": MoonsDataset,
+    # "mnist": MNIST,
 }
 
 
@@ -278,7 +278,7 @@ class FlowMatchingConfig:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Flow matching toy experiment with optional wandb.")
-    parser.add_argument("--dataset", choices=list(DATASETS.keys()), default="swiss_roll")
+    parser.add_argument("--dataset", choices=list(DATASET_CLASSES.keys()), default="swiss_roll")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=5e-4)
@@ -301,7 +301,12 @@ def main() -> None:
     use_normalization = not args.no_normalize
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    dataset = DATASETS[args.dataset]
+    dataset = DATASET_CLASSES[args.dataset](
+        ambient_dim=64,
+        n_samples=10_000,
+        noise=0.05,
+        random_state=args.seed,
+    )
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, generator=torch.Generator().manual_seed(args.seed)
     )
