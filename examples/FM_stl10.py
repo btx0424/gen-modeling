@@ -1,8 +1,5 @@
 """
-Minimal Flow Matching on MNIST.
-
-This file is for image training only. Synthetic toy training lives in `main.py`
-and `flow_matching.py`.
+Flow Matching on STL-10 with class-conditional U-Net and classifier-free guidance.
 """
 
 from __future__ import annotations
@@ -21,7 +18,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from gen_modeling.datasets.images import MNISTDataset
+from gen_modeling.datasets.images import STL10Dataset
 from gen_modeling.flow_matching import (
     LinearFlow,
     ModelArch,
@@ -30,68 +27,89 @@ from gen_modeling.flow_matching import (
     prediction_wrapper_class,
     update_ema,
 )
-from gen_modeling.modules import SmallConvNet
+from gen_modeling.modules import ConditionalUNet2D
 
 
 @dataclass
 class Config:
     data_root: str = "./data"
-    batch_size: int = 128
-    hidden_channels: int = 64
-    num_blocks: int = 4
+    split: str = "train"
+    batch_size: int = 32
+    base_channels: int = 64
     num_threads: int = 1
     seed: int = 42
-    train_epochs: int = 10
-    lr: float = 5e-4
+    train_epochs: int = 20
+    lr: float = 3e-4
     ema_decay: float = 0.999
     noise_scale: float = 1.0
     t_eps: float = 1e-2
-    sample_steps: int = 100
-    num_plot_samples: int = 64
+    sample_steps: int = 80
+    num_plot_samples: int = 40
     model_arch: ModelArch = "vanilla"
     pred_type: PredictionType = "v"
     loss_type: LossType = "v"
+    class_dropout_prob: float = 0.1
+    cfg_scale: float = 2.0
 
 
-class ImageDenoisingCNN(nn.Module):
-    def __init__(self, hidden_channels: int = 64, num_blocks: int = 4):
+class ImageFlowUNet(nn.Module):
+    def __init__(self, base_channels: int = 64, num_classes: int = 10):
         super().__init__()
-        self.sample_shape = (1, 28, 28)
-        self.backbone = SmallConvNet(2, hidden_channels, hidden_channels, num_blocks)
-        self.out = nn.Conv2d(hidden_channels, 1, kernel_size=3, padding=1)
-        nn.init.orthogonal_(self.out.weight)
-        nn.init.zeros_(self.out.bias)
+        self.sample_shape = (
+            STL10Dataset.info.channels,
+            STL10Dataset.info.height,
+            STL10Dataset.info.width,
+        )
+        self.backbone = ConditionalUNet2D(
+            in_channels=STL10Dataset.info.channels + 1,
+            out_channels=STL10Dataset.info.channels,
+            num_classes=num_classes,
+            base_channels=base_channels,
+            channel_mults=(1, 2, 4),
+        )
 
     def forward(
-        self,
-        x_t: torch.Tensor,
-        t: torch.Tensor,
-        y: torch.Tensor | None = None,
+        self, x_t: torch.Tensor, t: torch.Tensor, y: torch.Tensor | None
     ) -> torch.Tensor:
-        _ = y
         t_map = t.reshape(-1, 1, 1, 1).expand(-1, 1, x_t.shape[-2], x_t.shape[-1])
-        features = self.backbone(torch.cat([x_t, t_map], dim=1))
-        return self.out(features)
+        return self.backbone(torch.cat([x_t, t_map], dim=1), y)
 
 
 def build_model(config: Config) -> nn.Module:
-    base_network = ImageDenoisingCNN(config.hidden_channels, config.num_blocks)
+    base_network = ImageFlowUNet(config.base_channels, STL10Dataset.info.num_classes)
     wrapper_cls = prediction_wrapper_class(config.model_arch)
     return wrapper_cls(base_network, config.pred_type)
 
 
-def plot_mnist_grid(samples: torch.Tensor, path: Path, *, num_show: int = 64) -> None:
+def make_eval_labels(num_samples: int, num_classes: int, device: torch.device) -> torch.Tensor:
+    labels = torch.arange(num_classes, device=device, dtype=torch.long)
+    repeats = (num_samples + num_classes - 1) // num_classes
+    return labels.repeat(repeats)[:num_samples]
+
+
+def plot_stl10_grid(
+    samples: torch.Tensor,
+    labels: torch.Tensor,
+    path: Path,
+    *,
+    num_show: int,
+    num_classes: int,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     samples = samples[:num_show].detach().cpu().clamp(-1, 1)
-    n = int(np.ceil(np.sqrt(samples.shape[0])))
-    fig, axes = plt.subplots(n, n, figsize=(n, n))
+    samples = (samples + 1.0) * 0.5
+    labels = labels[:num_show].detach().cpu()
+    n_cols = num_classes
+    n_rows = int(np.ceil(samples.shape[0] / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(1.6 * n_cols, 1.6 * n_rows))
     axes = np.asarray(axes).reshape(-1)
-    for ax, image in zip(axes, samples, strict=False):
-        ax.imshow(image.squeeze(0), cmap="gray", vmin=-1, vmax=1)
+    for idx, (ax, image) in enumerate(zip(axes, samples, strict=False)):
+        ax.imshow(image.permute(1, 2, 0).numpy())
         ax.axis("off")
+        ax.set_title(str(int(labels[idx].item())), fontsize=8, pad=1)
     for ax in axes[samples.shape[0] :]:
         ax.axis("off")
-    plt.tight_layout(pad=0.05)
+    plt.tight_layout(pad=0.08)
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
@@ -103,8 +121,10 @@ def sample_and_save(
     out_path: Path,
     metrics_path: Path | None = None,
 ) -> dict[str, float]:
-    samples = flow.sample(config.num_plot_samples, device, config.sample_steps)
-    plot_mnist_grid(samples, out_path)
+    num_classes = STL10Dataset.info.num_classes
+    labels = make_eval_labels(config.num_plot_samples, num_classes, device)
+    samples = flow.sample_cfg(labels, device, config.sample_steps, config.cfg_scale)
+    plot_stl10_grid(samples, labels, out_path, num_show=config.num_plot_samples, num_classes=num_classes)
     metrics = {
         "sample_mean": samples.mean().item(),
         "sample_std": samples.std().item(),
@@ -117,11 +137,11 @@ def sample_and_save(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="MNIST Flow Matching.")
+    parser = argparse.ArgumentParser(description="STL-10 Flow Matching with CFG.")
     parser.add_argument("--data-root", type=str, default=Config.data_root)
+    parser.add_argument("--split", type=str, default=Config.split)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
-    parser.add_argument("--hidden-channels", type=int, default=Config.hidden_channels)
-    parser.add_argument("--num-blocks", type=int, default=Config.num_blocks)
+    parser.add_argument("--base-channels", type=int, default=Config.base_channels)
     parser.add_argument("--num-threads", type=int, default=Config.num_threads)
     parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--train-epochs", type=int, default=Config.train_epochs)
@@ -131,6 +151,8 @@ def main() -> None:
     parser.add_argument("--t-eps", type=float, default=Config.t_eps)
     parser.add_argument("--sample-steps", type=int, default=Config.sample_steps)
     parser.add_argument("--num-plot-samples", type=int, default=Config.num_plot_samples)
+    parser.add_argument("--class-dropout-prob", type=float, default=Config.class_dropout_prob)
+    parser.add_argument("--cfg-scale", type=float, default=Config.cfg_scale)
     parser.add_argument(
         "--model-arch",
         choices=["vanilla", "global_residual", "corrected_residual1", "corrected_residual2"],
@@ -142,9 +164,9 @@ def main() -> None:
 
     config = Config(
         data_root=args.data_root,
+        split=args.split,
         batch_size=args.batch_size,
-        hidden_channels=args.hidden_channels,
-        num_blocks=args.num_blocks,
+        base_channels=args.base_channels,
         num_threads=args.num_threads,
         seed=args.seed,
         train_epochs=args.train_epochs,
@@ -157,6 +179,8 @@ def main() -> None:
         model_arch=args.model_arch,
         pred_type=args.pred_type,
         loss_type=args.loss_type,
+        class_dropout_prob=args.class_dropout_prob,
+        cfg_scale=args.cfg_scale,
     )
 
     torch.set_num_threads(max(config.num_threads, 1))
@@ -164,7 +188,7 @@ def main() -> None:
     np.random.seed(config.seed)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    dataset = MNISTDataset(config.data_root, train=True, download=True, normalize=True)
+    dataset = STL10Dataset(config.data_root, split=config.split, download=True, normalize=True)
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
 
     model = build_model(config).to(device)
@@ -175,33 +199,37 @@ def main() -> None:
         noise_scale=config.noise_scale,
         loss_type=config.loss_type,
         t_eps=config.t_eps,
-        conditional=False,
+        conditional=True,
+        class_dropout_prob=config.class_dropout_prob,
     )
     ema_flow = LinearFlow(
         ema_model,
         noise_scale=config.noise_scale,
         loss_type=config.loss_type,
         t_eps=config.t_eps,
-        conditional=False,
+        conditional=True,
+        class_dropout_prob=0.0,
     )
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
-    out_dir = Path(__file__).resolve().parent / "outputs" / "FM_mnist"
+    out_dir = Path(__file__).resolve().parent / "outputs" / "FM_stl10"
 
     for epoch in range(config.train_epochs):
         model.train()
         pbar = tqdm(loader, desc=f"epoch {epoch}")
         last_loss = None
-        for x, _ in pbar:
+        for x, y in pbar:
             x = x.to(device)
+            y = y.to(device)
             optimizer.zero_grad(set_to_none=True)
-            loss = flow.compute_loss(x)
+            loss = flow.compute_loss(x, y)
             loss.backward()
             optimizer.step()
             update_ema(ema_model, model, config.ema_decay)
             last_loss = loss
             pbar.set_postfix(loss=f"{loss.item():.5f}")
-        epoch_grid = out_dir / f"fm_mnist_epoch_{epoch:03d}.png"
-        epoch_metrics = out_dir / f"fm_mnist_epoch_{epoch:03d}.json"
+
+        epoch_grid = out_dir / f"fm_stl10_epoch_{epoch:03d}.png"
+        epoch_metrics = out_dir / f"fm_stl10_epoch_{epoch:03d}.json"
         metrics = sample_and_save(ema_flow, config, device, epoch_grid, epoch_metrics)
         if last_loss is not None:
             print(
@@ -210,11 +238,11 @@ def main() -> None:
                 f"sample_std={metrics['sample_std']:.6f}"
             )
 
-    out = out_dir / "fm_mnist_samples.png"
-    metrics_path = out_dir / "fm_mnist_metrics.json"
+    out = out_dir / "fm_stl10_samples.png"
+    metrics_path = out_dir / "fm_stl10_metrics.json"
     metrics = sample_and_save(ema_flow, config, device, out, metrics_path)
     print(json.dumps(metrics, indent=2))
-    print("Saved per-epoch MNIST samples and final metrics under examples/outputs")
+    print("Saved per-epoch STL-10 samples and final metrics under examples/outputs")
     print(f"Saved plot to {out}")
 
 

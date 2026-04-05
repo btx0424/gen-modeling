@@ -68,8 +68,9 @@ class ConditionalUNet2D(nn.Module):
         self.out_channels = out_channels
         self.num_classes = num_classes
         self.cond_dim = cond_dim
+        self.null_class_idx = num_classes
 
-        self.label_embedding = nn.Embedding(num_classes, cond_dim)
+        self.label_embedding = nn.Embedding(num_classes + 1, cond_dim)
         self.in_conv = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
 
         widths = [base_channels * mult for mult in channel_mults]
@@ -113,8 +114,13 @@ class ConditionalUNet2D(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        cond = self.label_embedding(y)
+    def _encode_labels(self, y: torch.Tensor | None, batch_size: int, device: torch.device) -> torch.Tensor:
+        if y is None:
+            y = torch.full((batch_size,), self.null_class_idx, device=device, dtype=torch.long)
+        return self.label_embedding(y)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor | None) -> torch.Tensor:
+        cond = self._encode_labels(y, x.shape[0], x.device)
         h = self.in_conv(x)
         skips: list[torch.Tensor] = []
         for idx, block in enumerate(self.down_blocks):
