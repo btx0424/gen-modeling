@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset
 from torchvision.datasets import MNIST, STL10
-from torchvision.transforms import Compose, Normalize, ToTensor
+from torchvision.transforms import Compose, Normalize, Resize, ToTensor
 
 
 @dataclass(frozen=True)
@@ -48,7 +48,8 @@ class MNISTDataset(Dataset):
 
 
 class STL10Dataset(Dataset):
-    info = ImageDatasetInfo(channels=3, height=96, width=96, num_classes=10)
+    
+    info: ImageDatasetInfo
 
     def __init__(
         self,
@@ -57,11 +58,25 @@ class STL10Dataset(Dataset):
         split: str = "train",
         download: bool = True,
         normalize: bool = True,
+        size: int | None = 64,
     ) -> None:
         super().__init__()
-        transforms = [ToTensor()]
+        if size is not None:
+            h, w = size, size
+        else:
+            h, w = 96, 96
+        self.info = ImageDatasetInfo(channels=3, height=h, width=w, num_classes=10)
+        transforms = []
+        if size is not None:
+            transforms.append(Resize((h, w)))
+        transforms.append(ToTensor())
         if normalize:
-            transforms.append(Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)))
+            transforms.append(
+                Normalize(
+                    [0.44671061635017395, 0.4398098587989807, 0.4066464602947235],
+                    [0.26034098863601685, 0.2565772831439972, 0.2712673842906952],
+                )
+            )
         self.dataset = STL10(
             root=str(root),
             split=split,
