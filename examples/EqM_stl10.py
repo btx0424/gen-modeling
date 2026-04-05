@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -33,7 +32,6 @@ class Config:
     seed: int = 42
     train_epochs: int = 50
     lr: float = 3e-4
-    ema_decay: float = 0.999
     sample_steps: int = 80
     sample_stepsize: float = 0.01
     sample_sampler: Literal["gd", "nag"] = "nag"
@@ -46,18 +44,6 @@ def eqm_ct(a: float = 0.8, grad_scale: float = 4.0):
         return grad_scale * torch.where(t < a, 1.0, (1.0 - t) / (1.0 - a))
 
     return func
-
-
-@torch.no_grad()
-def update_ema(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
-    ema_params = dict(ema_model.named_parameters())
-    model_params = dict(model.named_parameters())
-    for name, param in model_params.items():
-        ema_params[name].mul_(decay).add_(param.data, alpha=1.0 - decay)
-    ema_buffers = dict(ema_model.named_buffers())
-    model_buffers = dict(model.named_buffers())
-    for name, buffer in model_buffers.items():
-        ema_buffers[name].copy_(buffer)
 
 
 class EqM(nn.Module):
@@ -225,9 +211,6 @@ def main() -> None:
         ),
         sample_shape=(dataset.info.channels, dataset.info.height, dataset.info.width),
     ).to(device)
-
-    ema_model = deepcopy(model).to(device)
-    ema_model.eval()
     optimizer = optim.AdamW(model.parameters(), lr=config.lr)
     out_dir = Path(__file__).resolve().parent / "outputs" / "EqM_stl10"
 
@@ -242,14 +225,13 @@ def main() -> None:
             loss = model.compute_loss(x, y)
             loss.backward()
             optimizer.step()
-            update_ema(ema_model, model, config.ema_decay)
             losses.append(loss.item())
             pbar.set_postfix(loss=f"{loss.item():.5f}")
 
         epoch_grid = out_dir / f"eqm_stl10_epoch_{epoch:03d}.png"
         epoch_metrics = out_dir / f"eqm_stl10_epoch_{epoch:03d}.json"
         metrics = sample_and_save(
-            ema_model,
+            model,
             dataset.info.num_classes,
             config,
             device,
@@ -267,7 +249,7 @@ def main() -> None:
     out = out_dir / "eqm_stl10_samples.png"
     metrics_path = out_dir / "eqm_metrics.json"
     metrics = sample_and_save(
-        ema_model,
+        model,
         dataset.info.num_classes,
         config,
         device,

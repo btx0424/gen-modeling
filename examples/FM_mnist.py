@@ -176,23 +176,23 @@ def main() -> None:
     for epoch in range(config.train_epochs):
         model.train()
         pbar = tqdm(loader, desc=f"epoch {epoch}")
-        last_loss = None
+        losses = []
         for x, _ in pbar:
             x = x.to(device)
             optimizer.zero_grad(set_to_none=True)
             loss = flow.compute_loss(x)
             loss.backward()
             optimizer.step()
-            last_loss = loss
+            losses.append(loss.item())
             pbar.set_postfix(loss=f"{loss.item():.5f}")
         epoch_grid = out_dir / f"fm_mnist_epoch_{epoch:03d}.png"
         epoch_metrics = out_dir / f"fm_mnist_epoch_{epoch:03d}.json"
         model.eval()
         metrics = sample_and_save(flow, config, device, epoch_grid, epoch_metrics)
-        if last_loss is not None:
+        if losses:
             print(
                 f"epoch {epoch}: "
-                f"loss={last_loss.item():.6f}, "
+                f"loss={np.mean(losses):.6f}, "
                 f"sample_std={metrics['sample_std']:.6f}"
             )
 

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -22,7 +21,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from gen_modeling.datasets.images import ImageDatasetInfo, MNISTDataset
-from gen_modeling.modules import SmallConvNet
+from gen_modeling.modules import ConditionalUNet2D
 
 
 @dataclass
@@ -30,17 +29,16 @@ class Config:
     data_root: str = "./data"
     batch_size: int = 128
     hidden_channels: int = 64
-    num_blocks: int = 4
+    base_channels: int = 64
     num_threads: int = 1
     seed: int = 42
-    train_epochs: int = 10
+    train_epochs: int = 50
     lr: float = 5e-4
-    ema_decay: float = 0.999
-    sample_steps: int = 100
+    sample_steps: int = 80
     sample_stepsize: float = 0.01
     sample_sampler: Literal["gd", "nag"] = "nag"
     sample_mu: float = 0.3
-    num_plot_samples: int = 100
+    num_plot_samples: int = 40
 
 
 def eqm_ct(a: float = 0.8, grad_scale: float = 4.0):
@@ -49,40 +47,12 @@ def eqm_ct(a: float = 0.8, grad_scale: float = 4.0):
     return func
 
 
-class ImageEqMBackbone(nn.Module):
-    def __init__(self, hidden_channels: int = 64, num_blocks: int = 4, num_classes: int = 10):
-        super().__init__()
-        self.in_channels = 1
-        self.sample_shape = (1, 28, 28)
-        self.num_classes = num_classes
-        self.backbone = SmallConvNet(1 + num_classes, hidden_channels, hidden_channels, num_blocks)
-        self.out = nn.Conv2d(hidden_channels, 1, kernel_size=3, padding=1)
-        nn.init.orthogonal_(self.out.weight)
-        nn.init.zeros_(self.out.bias)
-
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        y_onehot = torch.nn.functional.one_hot(y, num_classes=self.num_classes).to(dtype=x.dtype)
-        y_map = y_onehot[:, :, None, None].expand(-1, -1, x.shape[-2], x.shape[-1])
-        return self.out(self.backbone(torch.cat([x, y_map], dim=1)))
-
-
-@torch.no_grad()
-def update_ema(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
-    ema_params = dict(ema_model.named_parameters())
-    model_params = dict(model.named_parameters())
-    for name, param in model_params.items():
-        ema_params[name].mul_(decay).add_(param.data, alpha=1.0 - decay)
-    ema_buffers = dict(ema_model.named_buffers())
-    model_buffers = dict(model.named_buffers())
-    for name, buffer in model_buffers.items():
-        ema_buffers[name].copy_(buffer)
-
-
 class EqM(nn.Module):
-    def __init__(self, network: nn.Module):
+    def __init__(self, network: nn.Module, sample_shape: tuple[int, int, int]):
         super().__init__()
         self.network = network
         self.grad_magnitude = eqm_ct()
+        self.sample_shape = sample_shape
 
     def compute_loss(self, x1: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         expand_shape = (-1,) + (x1.ndim - 1) * (1,)
@@ -97,7 +67,7 @@ class EqM(nn.Module):
     def sample_gd(self, labels: torch.Tensor, device: torch.device, num_steps: int, stepsize: float) -> torch.Tensor:
         dtype = next(self.parameters()).dtype
         num_samples = labels.shape[0]
-        x = torch.randn((num_samples,) + self.network.sample_shape, device=device, dtype=dtype)
+        x = torch.randn((num_samples,) + self.sample_shape, device=device, dtype=dtype)
         for _ in range(num_steps):
             x = x + stepsize * self.network(x, labels)
         return x
@@ -106,7 +76,7 @@ class EqM(nn.Module):
     def sample_nag(self, labels: torch.Tensor, device: torch.device, num_steps: int, stepsize: float, mu: float) -> torch.Tensor:
         dtype = next(self.parameters()).dtype
         num_samples = labels.shape[0]
-        x = torch.randn((num_samples,) + self.network.sample_shape, device=device, dtype=dtype)
+        x = torch.randn((num_samples,) + self.sample_shape, device=device, dtype=dtype)
         momentum = torch.zeros_like(x)
         for _ in range(num_steps):
             lookahead = x + stepsize * mu * momentum
@@ -183,7 +153,7 @@ def main() -> None:
     parser.add_argument("--data-root", type=str, default=Config.data_root)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--hidden-channels", type=int, default=Config.hidden_channels)
-    parser.add_argument("--num-blocks", type=int, default=Config.num_blocks)
+    parser.add_argument("--base-channels", type=int, default=Config.base_channels)
     parser.add_argument("--num-threads", type=int, default=Config.num_threads)
     parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--train-epochs", type=int, default=Config.train_epochs)
@@ -199,7 +169,7 @@ def main() -> None:
         data_root=args.data_root,
         batch_size=args.batch_size,
         hidden_channels=args.hidden_channels,
-        num_blocks=args.num_blocks,
+        base_channels=args.base_channels,
         num_threads=args.num_threads,
         seed=args.seed,
         train_epochs=args.train_epochs,
@@ -220,17 +190,22 @@ def main() -> None:
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
 
     model = EqM(
-        ImageEqMBackbone(config.hidden_channels, config.num_blocks, dataset.info.num_classes)
+        ConditionalUNet2D(
+            in_channels=dataset.info.channels,
+            out_channels=dataset.info.channels,
+            num_classes=dataset.info.num_classes,
+            base_channels=config.base_channels,
+            channel_mults=(1, 2, 4),
+        ),
+        sample_shape=(dataset.info.channels, dataset.info.height, dataset.info.width),
     ).to(device)
-    ema_model = deepcopy(model).to(device)
-    ema_model.eval()
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
     out_dir = Path(__file__).resolve().parent / "outputs" / "EqM_mnist"
 
     for epoch in range(config.train_epochs):
         model.train()
         pbar = tqdm(loader, desc=f"epoch {epoch}")
-        last_loss = None
+        losses = []
         for x, y in pbar:
             x = x.to(device)
             y = y.to(device)
@@ -238,24 +213,23 @@ def main() -> None:
             loss = model.compute_loss(x, y)
             loss.backward()
             optimizer.step()
-            update_ema(ema_model, model, config.ema_decay)
-            last_loss = loss
+            losses.append(loss.item())
             pbar.set_postfix(loss=f"{loss.item():.5f}")
         epoch_grid = out_dir / f"eqm_mnist_epoch_{epoch:03d}.png"
         epoch_metrics = out_dir / f"eqm_mnist_epoch_{epoch:03d}.json"
         metrics = sample_and_save(
-            ema_model, config, device, epoch_grid, epoch_metrics, data_info=dataset.info
+            model, config, device, epoch_grid, epoch_metrics, data_info=dataset.info
         )
-        if last_loss is not None:
+        if losses:
             print(
                 f"epoch {epoch}: "
-                f"loss={last_loss.item():.6f}, "
+                f"loss={np.mean(losses):.6f}, "
                 f"sample_std={metrics['sample_std']:.6f}"
             )
 
     out = out_dir / "eqm_mnist_samples.png"
     metrics_path = out_dir / "eqm_metrics.json"
-    metrics = sample_and_save(ema_model, config, device, out, metrics_path, data_info=dataset.info)
+    metrics = sample_and_save(model, config, device, out, metrics_path, data_info=dataset.info)
     print(json.dumps(metrics, indent=2))
     print("Saved per-epoch MNIST samples and final metrics under examples/outputs")
     print(f"Saved plot to {out}")
