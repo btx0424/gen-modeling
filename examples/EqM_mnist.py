@@ -21,7 +21,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from gen_modeling.datasets.images import MNISTDataset
+from gen_modeling.datasets.images import ImageDatasetInfo, MNISTDataset
 from gen_modeling.modules import SmallConvNet
 
 
@@ -147,9 +147,17 @@ def plot_mnist_grid(
     plt.close(fig)
 
 
-def sample_and_save(model: EqM, config: Config, device: torch.device, out_path: Path, metrics_path: Path | None = None) -> dict[str, float]:
+def sample_and_save(
+    model: EqM,
+    config: Config,
+    device: torch.device,
+    out_path: Path,
+    metrics_path: Path | None = None,
+    *,
+    data_info: ImageDatasetInfo,
+) -> dict[str, float]:
     sample_fn = model.sample_nag if config.sample_sampler == "nag" else model.sample_gd
-    num_classes = MNISTDataset.info.num_classes
+    num_classes = data_info.num_classes
     labels = make_eval_labels(config.num_plot_samples, num_classes, device)
     samples = sample_fn(
         labels=labels,
@@ -211,7 +219,9 @@ def main() -> None:
     dataset = MNISTDataset(config.data_root, train=True, download=True, normalize=True)
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
 
-    model = EqM(ImageEqMBackbone(config.hidden_channels, config.num_blocks, MNISTDataset.info.num_classes)).to(device)
+    model = EqM(
+        ImageEqMBackbone(config.hidden_channels, config.num_blocks, dataset.info.num_classes)
+    ).to(device)
     ema_model = deepcopy(model).to(device)
     ema_model.eval()
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
@@ -233,7 +243,9 @@ def main() -> None:
             pbar.set_postfix(loss=f"{loss.item():.5f}")
         epoch_grid = out_dir / f"eqm_mnist_epoch_{epoch:03d}.png"
         epoch_metrics = out_dir / f"eqm_mnist_epoch_{epoch:03d}.json"
-        metrics = sample_and_save(ema_model, config, device, epoch_grid, epoch_metrics)
+        metrics = sample_and_save(
+            ema_model, config, device, epoch_grid, epoch_metrics, data_info=dataset.info
+        )
         if last_loss is not None:
             print(
                 f"epoch {epoch}: "
@@ -243,7 +255,7 @@ def main() -> None:
 
     out = out_dir / "eqm_mnist_samples.png"
     metrics_path = out_dir / "eqm_metrics.json"
-    metrics = sample_and_save(ema_model, config, device, out, metrics_path)
+    metrics = sample_and_save(ema_model, config, device, out, metrics_path, data_info=dataset.info)
     print(json.dumps(metrics, indent=2))
     print("Saved per-epoch MNIST samples and final metrics under examples/outputs")
     print(f"Saved plot to {out}")

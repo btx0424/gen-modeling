@@ -19,7 +19,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from gen_modeling.datasets.images import STL10Dataset
+from gen_modeling.datasets.images import ImageDatasetInfo, STL10Dataset, tensor_batch_to_display
 from gen_modeling.modules.cnn import (
     Downsample2d,
     PixelShuffleUpsample2d,
@@ -84,18 +84,20 @@ class PixelShuffleUpBlock(nn.Module):
 
 
 class ConditionalEncoder(nn.Module):
-    def __init__(self, base_channels: int, latent_dim: int, num_classes: int) -> None:
+    def __init__(
+        self, base_channels: int, latent_dim: int, num_classes: int, data_info: ImageDatasetInfo
+    ) -> None:
         super().__init__()
         self.num_classes = num_classes
-        in_channels = STL10Dataset.info.channels + num_classes
+        in_channels = data_info.channels + num_classes
         self.stem = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
         self.down1 = DownBlock(base_channels, base_channels)
         self.down2 = DownBlock(base_channels, base_channels * 2)
         self.down3 = DownBlock(base_channels * 2, base_channels * 4)
         self.mid = ResidualBlock2d(base_channels * 4, base_channels * 4)
         # Three Downsample2d stages: spatial size is H/8 × W/8 (matches decoder seed reshape).
-        h_sp = STL10Dataset.info.height // 8
-        w_sp = STL10Dataset.info.width // 8
+        h_sp = data_info.height // 8
+        w_sp = data_info.width // 8
         flat_dim = base_channels * 4 * h_sp * w_sp
         self.to_parames = nn.Linear(flat_dim, latent_dim * 2)
 
@@ -113,18 +115,24 @@ class ConditionalEncoder(nn.Module):
 
 
 class ConditionalDecoder(nn.Module):
-    def __init__(self, base_channels: int, latent_dim: int, num_classes: int) -> None:
+    def __init__(
+        self, base_channels: int, latent_dim: int, num_classes: int, data_info: ImageDatasetInfo
+    ) -> None:
         super().__init__()
         self.label_embedding = nn.Embedding(num_classes, latent_dim)
-        self.to_seed = nn.Linear(latent_dim * 2, base_channels * 4 * 12 * 12)
+        h_sp = data_info.height // 8
+        w_sp = data_info.width // 8
+        self.to_seed = nn.Linear(latent_dim * 2, base_channels * 4 * h_sp * w_sp)
         self.up1 = PixelShuffleUpBlock(base_channels * 4, base_channels * 2)
         self.up2 = PixelShuffleUpBlock(base_channels * 2, base_channels)
         self.up3 = PixelShuffleUpBlock(base_channels, base_channels)
-        self.out = nn.Conv2d(base_channels, STL10Dataset.info.channels, kernel_size=3, padding=1)
+        self.out = nn.Conv2d(base_channels, data_info.channels, kernel_size=3, padding=1)
+        self._seed_h = h_sp
+        self._seed_w = w_sp
 
     def forward(self, z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         cond = torch.cat([z, self.label_embedding(y)], dim=-1)
-        h = self.to_seed(cond).reshape(z.shape[0], -1, 12, 12)
+        h = self.to_seed(cond).reshape(z.shape[0], -1, self._seed_h, self._seed_w)
         h = self.up1(h)
         h = self.up2(h)
         h = self.up3(h)
@@ -132,17 +140,14 @@ class ConditionalDecoder(nn.Module):
 
 
 class CVAE(nn.Module):
-    def __init__(self, base_channels: int, latent_dim: int, num_classes: int) -> None:
+    def __init__(self, base_channels: int, latent_dim: int, data_info: ImageDatasetInfo) -> None:
         super().__init__()
-        self.encoder = ConditionalEncoder(base_channels, latent_dim, num_classes)
-        self.decoder = ConditionalDecoder(base_channels, latent_dim, num_classes)
+        nc = data_info.num_classes
+        self.encoder = ConditionalEncoder(base_channels, latent_dim, nc, data_info)
+        self.decoder = ConditionalDecoder(base_channels, latent_dim, nc, data_info)
         self.latent_dim = latent_dim
-        self.num_classes = num_classes
-        self.sample_shape = (
-            STL10Dataset.info.channels,
-            STL10Dataset.info.height,
-            STL10Dataset.info.width,
-        )
+        self.num_classes = nc
+        self.sample_shape = (data_info.channels, data_info.height, data_info.width)
         init_conv_modules(self)
 
     def encode(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -191,10 +196,10 @@ def plot_stl10_grid(
     *,
     num_show: int,
     num_classes: int,
+    data_info: ImageDatasetInfo,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    samples = samples[:num_show].detach().cpu().clamp(-1, 1)
-    samples = (samples + 1.0) * 0.5
+    samples = tensor_batch_to_display(samples[:num_show], data_info)
     labels = labels[:num_show].detach().cpu()
     n_cols = num_classes
     n_rows = int(np.ceil(samples.shape[0] / n_cols))
@@ -219,14 +224,13 @@ def plot_stl10_recon_grid(
     *,
     num_show: int,
     num_classes: int,
+    data_info: ImageDatasetInfo,
 ) -> None:
     """Each cell: [original | reconstruction] side by side; title is the class label."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    inputs = inputs[:num_show].detach().cpu().clamp(-1, 1)
-    recons = recons[:num_show].detach().cpu().clamp(-1, 1)
+    inputs_vis = tensor_batch_to_display(inputs[:num_show], data_info)
+    recons_vis = tensor_batch_to_display(recons[:num_show], data_info)
     labels = labels[:num_show].detach().cpu()
-    inputs_vis = (inputs + 1.0) * 0.5
-    recons_vis = (recons + 1.0) * 0.5
     pairs = torch.cat([inputs_vis, recons_vis], dim=-1)
     n_cols = num_classes
     n_rows = int(np.ceil(num_show / n_cols))
@@ -253,10 +257,15 @@ def sample_and_save(
     recon_path: Path | None = None,
     eval_x: torch.Tensor | None = None,
     eval_y: torch.Tensor | None = None,
+    *,
+    data_info: ImageDatasetInfo,
 ) -> dict[str, float]:
-    labels = make_eval_labels(config.num_plot_samples, STL10Dataset.info.num_classes, device)
+    nc = data_info.num_classes
+    labels = make_eval_labels(config.num_plot_samples, nc, device)
     samples = model.sample(labels, device)
-    plot_stl10_grid(samples, labels, out_path, num_show=config.num_plot_samples, num_classes=STL10Dataset.info.num_classes)
+    plot_stl10_grid(
+        samples, labels, out_path, num_show=config.num_plot_samples, num_classes=nc, data_info=data_info
+    )
     metrics: dict[str, float] = {
         "sample_mean": samples.mean().item(),
         "sample_std": samples.std().item(),
@@ -275,7 +284,8 @@ def sample_and_save(
             y_e,
             recon_path,
             num_show=n,
-            num_classes=STL10Dataset.info.num_classes,
+            num_classes=nc,
+            data_info=data_info,
         )
         metrics["recon_mse_eval"] = F.mse_loss(recons, x_e).item()
     if metrics_path is not None:
@@ -343,7 +353,7 @@ def main() -> None:
     vis_loader = DataLoader(dataset, batch_size=config.num_plot_samples, shuffle=False)
     eval_x, eval_y = next(iter(vis_loader))
 
-    model = CVAE(config.base_channels, config.latent_dim, STL10Dataset.info.num_classes).to(device)
+    model = CVAE(config.base_channels, config.latent_dim, dataset.info).to(device)
     if not args.no_compile:
         model = torch.compile(model)
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
@@ -380,6 +390,7 @@ def main() -> None:
             recon_path=epoch_recon,
             eval_x=eval_x,
             eval_y=eval_y,
+            data_info=dataset.info,
         )
         if last_metrics is not None:
             extra = (
@@ -409,6 +420,7 @@ def main() -> None:
         recon_path=out_recon,
         eval_x=eval_x,
         eval_y=eval_y,
+        data_info=dataset.info,
     )
     print(json.dumps(metrics, indent=2))
     print("Saved per-epoch STL-10 samples, recon grids, and final metrics under examples/outputs")

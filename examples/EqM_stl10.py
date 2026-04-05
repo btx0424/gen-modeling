@@ -19,7 +19,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from gen_modeling.datasets.images import STL10Dataset
+from gen_modeling.datasets.images import ImageDatasetInfo, STL10Dataset, tensor_batch_to_display
 from gen_modeling.modules import ConditionalUNet2D
 
 
@@ -27,11 +27,11 @@ from gen_modeling.modules import ConditionalUNet2D
 class Config:
     data_root: str = "./data"
     split: str = "train"
-    batch_size: int = 32
+    batch_size: int = 64
     base_channels: int = 64
     num_threads: int = 1
     seed: int = 42
-    train_epochs: int = 20
+    train_epochs: int = 50
     lr: float = 3e-4
     ema_decay: float = 0.999
     sample_steps: int = 80
@@ -48,26 +48,6 @@ def eqm_ct(a: float = 0.8, grad_scale: float = 4.0):
     return func
 
 
-class ImageEqMBackbone(nn.Module):
-    def __init__(self, base_channels: int = 64, num_classes: int = 10):
-        super().__init__()
-        self.sample_shape = (
-            STL10Dataset.info.channels,
-            STL10Dataset.info.height,
-            STL10Dataset.info.width,
-        )
-        self.network = ConditionalUNet2D(
-            in_channels=STL10Dataset.info.channels,
-            out_channels=STL10Dataset.info.channels,
-            num_classes=num_classes,
-            base_channels=base_channels,
-            channel_mults=(1, 2, 4),
-        )
-
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return self.network(x, y)
-
-
 @torch.no_grad()
 def update_ema(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
     ema_params = dict(ema_model.named_parameters())
@@ -81,9 +61,10 @@ def update_ema(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
 
 
 class EqM(nn.Module):
-    def __init__(self, network: nn.Module):
+    def __init__(self, network: nn.Module, sample_shape: tuple[int, int, int]):
         super().__init__()
         self.network = network
+        self.sample_shape = sample_shape
         self.grad_magnitude = eqm_ct()
 
     def compute_loss(self, x1: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -113,7 +94,7 @@ class EqM(nn.Module):
         mu: float,
     ) -> torch.Tensor:
         dtype = next(self.parameters()).dtype
-        x = torch.randn((labels.shape[0],) + self.network.sample_shape, device=device, dtype=dtype)
+        x = torch.randn((labels.shape[0],) + self.sample_shape, device=device, dtype=dtype)
         momentum = torch.zeros_like(x)
         for _ in range(num_steps):
             lookahead = x + stepsize * mu * momentum
@@ -135,10 +116,10 @@ def plot_stl10_grid(
     *,
     num_show: int,
     num_classes: int,
+    data_info: ImageDatasetInfo,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    samples = samples[:num_show].detach().cpu().clamp(-1, 1)
-    samples = (samples + 1.0) * 0.5
+    samples = tensor_batch_to_display(samples[:num_show], data_info)
     labels = labels[:num_show].detach().cpu()
     n_cols = num_classes
     n_rows = int(np.ceil(samples.shape[0] / n_cols))
@@ -157,13 +138,15 @@ def plot_stl10_grid(
 
 def sample_and_save(
     model: EqM,
+    num_classes: int,
     config: Config,
     device: torch.device,
     out_path: Path,
     metrics_path: Path | None = None,
+    *,
+    data_info: ImageDatasetInfo,
 ) -> dict[str, float]:
     sample_fn = model.sample_nag if config.sample_sampler == "nag" else model.sample_gd
-    num_classes = STL10Dataset.info.num_classes
     labels = make_eval_labels(config.num_plot_samples, num_classes, device)
     samples = sample_fn(
         labels=labels,
@@ -172,7 +155,14 @@ def sample_and_save(
         stepsize=config.sample_stepsize,
         **({"mu": config.sample_mu} if config.sample_sampler == "nag" else {}),
     )
-    plot_stl10_grid(samples, labels, out_path, num_show=config.num_plot_samples, num_classes=num_classes)
+    plot_stl10_grid(
+        samples,
+        labels,
+        out_path,
+        num_show=config.num_plot_samples,
+        num_classes=num_classes,
+        data_info=data_info,
+    )
     metrics = {
         "sample_mean": samples.mean().item(),
         "sample_std": samples.std().item(),
@@ -225,16 +215,26 @@ def main() -> None:
     dataset = STL10Dataset(config.data_root, split=config.split, download=True, normalize=True)
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
 
-    model = EqM(ImageEqMBackbone(config.base_channels, STL10Dataset.info.num_classes)).to(device)
+    model = EqM(
+        network=ConditionalUNet2D(
+            in_channels=dataset.info.channels,
+            out_channels=dataset.info.channels,
+            num_classes=dataset.info.num_classes,
+            base_channels=config.base_channels,
+            channel_mults=(1, 2, 4, 4),
+        ),
+        sample_shape=(dataset.info.channels, dataset.info.height, dataset.info.width),
+    ).to(device)
+
     ema_model = deepcopy(model).to(device)
     ema_model.eval()
-    optimizer = optim.Adam(model.parameters(), lr=config.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=config.lr)
     out_dir = Path(__file__).resolve().parent / "outputs" / "EqM_stl10"
 
     for epoch in range(config.train_epochs):
         model.train()
         pbar = tqdm(loader, desc=f"epoch {epoch}")
-        last_loss = None
+        losses = []
         for x, y in pbar:
             x = x.to(device)
             y = y.to(device)
@@ -243,22 +243,38 @@ def main() -> None:
             loss.backward()
             optimizer.step()
             update_ema(ema_model, model, config.ema_decay)
-            last_loss = loss
+            losses.append(loss.item())
             pbar.set_postfix(loss=f"{loss.item():.5f}")
 
         epoch_grid = out_dir / f"eqm_stl10_epoch_{epoch:03d}.png"
         epoch_metrics = out_dir / f"eqm_stl10_epoch_{epoch:03d}.json"
-        metrics = sample_and_save(ema_model, config, device, epoch_grid, epoch_metrics)
-        if last_loss is not None:
+        metrics = sample_and_save(
+            ema_model,
+            dataset.info.num_classes,
+            config,
+            device,
+            epoch_grid,
+            epoch_metrics,
+            data_info=dataset.info,
+        )
+        if losses:
             print(
                 f"epoch {epoch}: "
-                f"loss={last_loss.item():.6f}, "
+                f"loss={np.mean(losses):.6f}, "
                 f"sample_std={metrics['sample_std']:.6f}"
             )
 
     out = out_dir / "eqm_stl10_samples.png"
     metrics_path = out_dir / "eqm_metrics.json"
-    metrics = sample_and_save(ema_model, config, device, out, metrics_path)
+    metrics = sample_and_save(
+        ema_model,
+        dataset.info.num_classes,
+        config,
+        device,
+        out,
+        metrics_path,
+        data_info=dataset.info,
+    )
     print(json.dumps(metrics, indent=2))
     print("Saved per-epoch STL-10 samples and final metrics under examples/outputs")
     print(f"Saved plot to {out}")

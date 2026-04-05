@@ -1,4 +1,4 @@
-from .images import MNISTDataset, STL10Dataset
+from .images import ImageDatasetInfo, MNISTDataset, STL10Dataset, tensor_batch_to_display
 from .synthetic import (
     CheckerboardDataset,
     GaussianMixtureDataset,
@@ -10,9 +10,11 @@ from .synthetic import (
 __all__ = [
     "CheckerboardDataset",
     "GaussianMixtureDataset",
+    "ImageDatasetInfo",
     "MNISTDataset",
     "MoonsDataset",
     "STL10Dataset",
     "SwissRollDataset",
+    "tensor_batch_to_display",
     "SyntheticAmbientDataset",
 ]

@@ -17,7 +17,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from gen_modeling.datasets.images import STL10Dataset
+from gen_modeling.datasets.images import ImageDatasetInfo, STL10Dataset, tensor_batch_to_display
 from gen_modeling.flow_matching import (
     LinearFlow,
     ModelArch,
@@ -50,17 +50,13 @@ class Config:
 
 
 class ImageFlowUNet(nn.Module):
-    def __init__(self, base_channels: int = 64, num_classes: int = 10):
+    def __init__(self, base_channels: int, data_info: ImageDatasetInfo):
         super().__init__()
-        self.sample_shape = (
-            STL10Dataset.info.channels,
-            STL10Dataset.info.height,
-            STL10Dataset.info.width,
-        )
+        self.sample_shape = (data_info.channels, data_info.height, data_info.width)
         self.backbone = ConditionalUNet2D(
-            in_channels=STL10Dataset.info.channels,
-            out_channels=STL10Dataset.info.channels,
-            num_classes=num_classes,
+            in_channels=data_info.channels,
+            out_channels=data_info.channels,
+            num_classes=data_info.num_classes,
             base_channels=base_channels,
             channel_mults=(1, 2, 4),
         )
@@ -71,8 +67,8 @@ class ImageFlowUNet(nn.Module):
         return self.backbone(x_t, y, t)
 
 
-def build_model(config: Config) -> nn.Module:
-    base_network = ImageFlowUNet(config.base_channels, STL10Dataset.info.num_classes)
+def build_model(config: Config, data_info: ImageDatasetInfo) -> nn.Module:
+    base_network = ImageFlowUNet(config.base_channels, data_info)
     wrapper_cls = prediction_wrapper_class(config.model_arch)
     return wrapper_cls(base_network, config.pred_type)
 
@@ -90,10 +86,10 @@ def plot_stl10_grid(
     *,
     num_show: int,
     num_classes: int,
+    data_info: ImageDatasetInfo,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    samples = samples[:num_show].detach().cpu().clamp(-1, 1)
-    samples = (samples + 1.0) * 0.5
+    samples = tensor_batch_to_display(samples[:num_show], data_info)
     labels = labels[:num_show].detach().cpu()
     n_cols = num_classes
     n_rows = int(np.ceil(samples.shape[0] / n_cols))
@@ -116,11 +112,20 @@ def sample_and_save(
     device: torch.device,
     out_path: Path,
     metrics_path: Path | None = None,
+    *,
+    data_info: ImageDatasetInfo,
 ) -> dict[str, float]:
-    num_classes = STL10Dataset.info.num_classes
+    num_classes = data_info.num_classes
     labels = make_eval_labels(config.num_plot_samples, num_classes, device)
     samples = flow.sample_cfg(labels, device, config.sample_steps, config.cfg_scale)
-    plot_stl10_grid(samples, labels, out_path, num_show=config.num_plot_samples, num_classes=num_classes)
+    plot_stl10_grid(
+        samples,
+        labels,
+        out_path,
+        num_show=config.num_plot_samples,
+        num_classes=num_classes,
+        data_info=data_info,
+    )
     metrics = {
         "sample_mean": samples.mean().item(),
         "sample_std": samples.std().item(),
@@ -189,8 +194,9 @@ def main() -> None:
 
     dataset = STL10Dataset(config.data_root, split=config.split, download=True, normalize=True)
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+    data_info = dataset.info
 
-    model = build_model(config).to(device)
+    model = build_model(config, data_info).to(device)
     if not args.no_compile:
         torch.set_float32_matmul_precision('high')
         model = torch.compile(model)
@@ -222,7 +228,9 @@ def main() -> None:
         epoch_grid = out_dir / f"fm_stl10_epoch_{epoch:03d}.png"
         epoch_metrics = out_dir / f"fm_stl10_epoch_{epoch:03d}.json"
         model.eval()
-        metrics = sample_and_save(flow, config, device, epoch_grid, epoch_metrics)
+        metrics = sample_and_save(
+            flow, config, device, epoch_grid, epoch_metrics, data_info=data_info
+        )
         if last_loss is not None:
             print(
                 f"epoch {epoch}: "
@@ -233,7 +241,7 @@ def main() -> None:
     out = out_dir / "fm_stl10_samples.png"
     metrics_path = out_dir / "fm_stl10_metrics.json"
     model.eval()
-    metrics = sample_and_save(flow, config, device, out, metrics_path)
+    metrics = sample_and_save(flow, config, device, out, metrics_path, data_info=data_info)
     print(json.dumps(metrics, indent=2))
     print("Saved per-epoch STL-10 samples and final metrics under examples/outputs")
     print(f"Saved plot to {out}")
