@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,7 +27,6 @@ from gen_modeling.flow_matching import (
     PredictionType,
     LossType,
     prediction_wrapper_class,
-    update_ema,
 )
 from gen_modeling.modules import SmallConvNet
 
@@ -43,7 +41,6 @@ class Config:
     seed: int = 42
     train_epochs: int = 10
     lr: float = 5e-4
-    ema_decay: float = 0.999
     noise_scale: float = 1.0
     t_eps: float = 1e-2
     sample_steps: int = 100
@@ -126,7 +123,6 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--train-epochs", type=int, default=Config.train_epochs)
     parser.add_argument("--lr", type=float, default=Config.lr)
-    parser.add_argument("--ema-decay", type=float, default=Config.ema_decay)
     parser.add_argument("--noise-scale", type=float, default=Config.noise_scale)
     parser.add_argument("--t-eps", type=float, default=Config.t_eps)
     parser.add_argument("--sample-steps", type=int, default=Config.sample_steps)
@@ -149,7 +145,6 @@ def main() -> None:
         seed=args.seed,
         train_epochs=args.train_epochs,
         lr=args.lr,
-        ema_decay=args.ema_decay,
         noise_scale=args.noise_scale,
         t_eps=args.t_eps,
         sample_steps=args.sample_steps,
@@ -168,17 +163,8 @@ def main() -> None:
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
 
     model = build_model(config).to(device)
-    ema_model = deepcopy(model).to(device)
-    ema_model.eval()
     flow = LinearFlow(
         model,
-        noise_scale=config.noise_scale,
-        loss_type=config.loss_type,
-        t_eps=config.t_eps,
-        conditional=False,
-    )
-    ema_flow = LinearFlow(
-        ema_model,
         noise_scale=config.noise_scale,
         loss_type=config.loss_type,
         t_eps=config.t_eps,
@@ -197,12 +183,12 @@ def main() -> None:
             loss = flow.compute_loss(x)
             loss.backward()
             optimizer.step()
-            update_ema(ema_model, model, config.ema_decay)
             last_loss = loss
             pbar.set_postfix(loss=f"{loss.item():.5f}")
         epoch_grid = out_dir / f"fm_mnist_epoch_{epoch:03d}.png"
         epoch_metrics = out_dir / f"fm_mnist_epoch_{epoch:03d}.json"
-        metrics = sample_and_save(ema_flow, config, device, epoch_grid, epoch_metrics)
+        model.eval()
+        metrics = sample_and_save(flow, config, device, epoch_grid, epoch_metrics)
         if last_loss is not None:
             print(
                 f"epoch {epoch}: "
@@ -212,7 +198,8 @@ def main() -> None:
 
     out = out_dir / "fm_mnist_samples.png"
     metrics_path = out_dir / "fm_mnist_metrics.json"
-    metrics = sample_and_save(ema_flow, config, device, out, metrics_path)
+    model.eval()
+    metrics = sample_and_save(flow, config, device, out, metrics_path)
     print(json.dumps(metrics, indent=2))
     print("Saved per-epoch MNIST samples and final metrics under examples/outputs")
     print(f"Saved plot to {out}")

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from copy import deepcopy
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,16 +32,29 @@ from gen_modeling.modules.cnn import (
 class Config:
     data_root: str = "./data"
     split: str = "train"
-    batch_size: int = 32
+    batch_size: int = 64
     base_channels: int = 64
-    latent_dim: int = 256
+    latent_dim: int = 512
     num_threads: int = 1
+    # DataLoader workers (0 = main process only). Default ~ half of CPUs, capped at 8.
+    num_workers: int = min(8, max(0, (os.cpu_count() or 8) // 2))
     seed: int = 42
     train_epochs: int = 30
     lr: float = 3e-4
-    ema_decay: float = 0.999
-    kl_beta: float = 1e-3
+    kl_beta: float = 0.1
     num_plot_samples: int = 40
+
+
+def _train_loader_kwargs(num_workers: int, *, pin_memory: bool) -> dict:
+    """Extra DataLoader args for throughput. Tune `--num-workers` using wall time / GPU util."""
+    kw: dict = {}
+    if num_workers > 0:
+        kw["num_workers"] = num_workers
+        kw["persistent_workers"] = True
+        kw["prefetch_factor"] = 2
+    if pin_memory:
+        kw["pin_memory"] = True
+    return kw
 
 
 class DownBlock(nn.Module):
@@ -80,8 +93,11 @@ class ConditionalEncoder(nn.Module):
         self.down2 = DownBlock(base_channels, base_channels * 2)
         self.down3 = DownBlock(base_channels * 2, base_channels * 4)
         self.mid = ResidualBlock2d(base_channels * 4, base_channels * 4)
-        self.to_mu = nn.Linear(base_channels * 4, latent_dim)
-        self.to_logvar = nn.Linear(base_channels * 4, latent_dim)
+        # Three Downsample2d stages: spatial size is H/8 × W/8 (matches decoder seed reshape).
+        h_sp = STL10Dataset.info.height // 8
+        w_sp = STL10Dataset.info.width // 8
+        flat_dim = base_channels * 4 * h_sp * w_sp
+        self.to_parames = nn.Linear(flat_dim, latent_dim * 2)
 
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         y_onehot = F.one_hot(y, num_classes=self.num_classes).to(dtype=x.dtype)
@@ -91,8 +107,9 @@ class ConditionalEncoder(nn.Module):
         h = self.down2(h)
         h = self.down3(h)
         h = self.mid(h)
-        pooled = h.mean(dim=(2, 3))
-        return self.to_mu(pooled), self.to_logvar(pooled)
+        params = self.to_parames(h.flatten(1))
+        mu, logvar = params.chunk(2, dim=-1)
+        return mu, logvar
 
 
 class ConditionalDecoder(nn.Module):
@@ -126,9 +143,6 @@ class CVAE(nn.Module):
             STL10Dataset.info.height,
             STL10Dataset.info.width,
         )
-        self._init_weights()
-
-    def _init_weights(self) -> None:
         init_conv_modules(self)
 
     def encode(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -164,18 +178,6 @@ class CVAE(nn.Module):
         return self.decode(z, labels)
 
 
-@torch.no_grad()
-def update_ema(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
-    ema_params = dict(ema_model.named_parameters())
-    model_params = dict(model.named_parameters())
-    for name, param in model_params.items():
-        ema_params[name].mul_(decay).add_(param.data, alpha=1.0 - decay)
-    ema_buffers = dict(ema_model.named_buffers())
-    model_buffers = dict(model.named_buffers())
-    for name, buffer in model_buffers.items():
-        ema_buffers[name].copy_(buffer)
-
-
 def make_eval_labels(num_samples: int, num_classes: int, device: torch.device) -> torch.Tensor:
     labels = torch.arange(num_classes, device=device, dtype=torch.long)
     repeats = (num_samples + num_classes - 1) // num_classes
@@ -209,22 +211,73 @@ def plot_stl10_grid(
     plt.close(fig)
 
 
+def plot_stl10_recon_grid(
+    inputs: torch.Tensor,
+    recons: torch.Tensor,
+    labels: torch.Tensor,
+    path: Path,
+    *,
+    num_show: int,
+    num_classes: int,
+) -> None:
+    """Each cell: [original | reconstruction] side by side; title is the class label."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    inputs = inputs[:num_show].detach().cpu().clamp(-1, 1)
+    recons = recons[:num_show].detach().cpu().clamp(-1, 1)
+    labels = labels[:num_show].detach().cpu()
+    inputs_vis = (inputs + 1.0) * 0.5
+    recons_vis = (recons + 1.0) * 0.5
+    pairs = torch.cat([inputs_vis, recons_vis], dim=-1)
+    n_cols = num_classes
+    n_rows = int(np.ceil(num_show / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.0 * n_cols, 1.6 * n_rows))
+    axes = np.asarray(axes).reshape(-1)
+    for idx, (ax, image) in enumerate(zip(axes, pairs, strict=False)):
+        ax.imshow(image.permute(1, 2, 0).numpy())
+        ax.axis("off")
+        ax.set_title(str(int(labels[idx].item())), fontsize=8, pad=1)
+    for ax in axes[num_show:]:
+        ax.axis("off")
+    plt.tight_layout(pad=0.08)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 def sample_and_save(
     model: CVAE,
     config: Config,
     device: torch.device,
     out_path: Path,
     metrics_path: Path | None = None,
+    *,
+    recon_path: Path | None = None,
+    eval_x: torch.Tensor | None = None,
+    eval_y: torch.Tensor | None = None,
 ) -> dict[str, float]:
     labels = make_eval_labels(config.num_plot_samples, STL10Dataset.info.num_classes, device)
     samples = model.sample(labels, device)
     plot_stl10_grid(samples, labels, out_path, num_show=config.num_plot_samples, num_classes=STL10Dataset.info.num_classes)
-    metrics = {
+    metrics: dict[str, float] = {
         "sample_mean": samples.mean().item(),
         "sample_std": samples.std().item(),
         "sample_min": samples.min().item(),
         "sample_max": samples.max().item(),
     }
+    if recon_path is not None and eval_x is not None and eval_y is not None:
+        x_e = eval_x.to(device)
+        y_e = eval_y.to(device)
+        mu, _ = model.encode(x_e, y_e)
+        recons = model.decode(mu, y_e)
+        n = min(config.num_plot_samples, x_e.shape[0])
+        plot_stl10_recon_grid(
+            x_e,
+            recons,
+            y_e,
+            recon_path,
+            num_show=n,
+            num_classes=STL10Dataset.info.num_classes,
+        )
+        metrics["recon_mse_eval"] = F.mse_loss(recons, x_e).item()
     if metrics_path is not None:
         metrics_path.write_text(json.dumps(metrics, indent=2))
     return metrics
@@ -238,14 +291,26 @@ def main() -> None:
     parser.add_argument("--base-channels", type=int, default=Config.base_channels)
     parser.add_argument("--latent-dim", type=int, default=Config.latent_dim)
     parser.add_argument("--num-threads", type=int, default=Config.num_threads)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="DataLoader worker processes (default: from Config, ~CPU/2 capped at 8). Use 0 to disable.",
+    )
     parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--train-epochs", type=int, default=Config.train_epochs)
     parser.add_argument("--lr", type=float, default=Config.lr)
-    parser.add_argument("--ema-decay", type=float, default=Config.ema_decay)
     parser.add_argument("--kl-beta", type=float, default=Config.kl_beta)
     parser.add_argument("--num-plot-samples", type=int, default=Config.num_plot_samples)
+    parser.add_argument(
+        "--no-compile",
+        action="store_true",
+        help="Disable torch.compile (debugging or environments with inductor issues).",
+    )
     args = parser.parse_args()
 
+    num_workers = Config.num_workers if args.num_workers is None else max(0, args.num_workers)
     config = Config(
         data_root=args.data_root,
         split=args.split,
@@ -253,10 +318,10 @@ def main() -> None:
         base_channels=args.base_channels,
         latent_dim=args.latent_dim,
         num_threads=args.num_threads,
+        num_workers=num_workers,
         seed=args.seed,
         train_epochs=args.train_epochs,
         lr=args.lr,
-        ema_decay=args.ema_decay,
         kl_beta=args.kl_beta,
         num_plot_samples=args.num_plot_samples,
     )
@@ -267,11 +332,20 @@ def main() -> None:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     dataset = STL10Dataset(config.data_root, split=config.split, download=True, normalize=True)
-    loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+    pin = device.type == "cuda"
+    loader = DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        **_train_loader_kwargs(config.num_workers, pin_memory=pin),
+    )
+    # Fixed batch for reconstruction vis (same images every epoch); workers not worth it.
+    vis_loader = DataLoader(dataset, batch_size=config.num_plot_samples, shuffle=False)
+    eval_x, eval_y = next(iter(vis_loader))
 
     model = CVAE(config.base_channels, config.latent_dim, STL10Dataset.info.num_classes).to(device)
-    ema_model = deepcopy(model).to(device)
-    ema_model.eval()
+    if not args.no_compile:
+        model = torch.compile(model)
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
     out_dir = Path(__file__).resolve().parent / "outputs" / "CVAE_stl10"
 
@@ -286,7 +360,6 @@ def main() -> None:
             loss, metrics = model.compute_loss(x, y, config.kl_beta)
             loss.backward()
             optimizer.step()
-            update_ema(ema_model, model, config.ema_decay)
             last_metrics = metrics
             pbar.set_postfix(
                 loss=f"{metrics['loss'].item():.5f}",
@@ -295,23 +368,51 @@ def main() -> None:
             )
 
         epoch_grid = out_dir / f"cvae_stl10_epoch_{epoch:03d}.png"
+        epoch_recon = out_dir / f"cvae_stl10_epoch_{epoch:03d}_recon.png"
         epoch_metrics = out_dir / f"cvae_stl10_epoch_{epoch:03d}.json"
-        metrics = sample_and_save(ema_model, config, device, epoch_grid, epoch_metrics)
+        model.eval()
+        metrics = sample_and_save(
+            model,
+            config,
+            device,
+            epoch_grid,
+            epoch_metrics,
+            recon_path=epoch_recon,
+            eval_x=eval_x,
+            eval_y=eval_y,
+        )
         if last_metrics is not None:
+            extra = (
+                f", recon_mse_eval={metrics['recon_mse_eval']:.6f}"
+                if "recon_mse_eval" in metrics
+                else ""
+            )
             print(
                 f"epoch {epoch}: "
                 f"loss={last_metrics['loss'].item():.6f}, "
                 f"recon={last_metrics['recon_loss'].item():.6f}, "
                 f"kl={last_metrics['kl'].item():.6f}, "
                 f"sample_std={metrics['sample_std']:.6f}"
+                f"{extra}"
             )
 
     out = out_dir / "cvae_stl10_samples.png"
+    out_recon = out_dir / "cvae_stl10_recon.png"
     metrics_path = out_dir / "cvae_metrics.json"
-    metrics = sample_and_save(ema_model, config, device, out, metrics_path)
+    model.eval()
+    metrics = sample_and_save(
+        model,
+        config,
+        device,
+        out,
+        metrics_path,
+        recon_path=out_recon,
+        eval_x=eval_x,
+        eval_y=eval_y,
+    )
     print(json.dumps(metrics, indent=2))
-    print("Saved per-epoch STL-10 samples and final metrics under examples/outputs")
-    print(f"Saved plot to {out}")
+    print("Saved per-epoch STL-10 samples, recon grids, and final metrics under examples/outputs")
+    print(f"Saved plots to {out} and {out_recon}")
 
 
 if __name__ == "__main__":

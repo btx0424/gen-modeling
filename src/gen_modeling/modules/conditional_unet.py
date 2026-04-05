@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,9 +13,31 @@ from .cnn import (
 )
 
 
+def sinusoidal_time_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    DDPM-style Fourier features for scalar time (e.g. flow time in [0, 1]).
+    t: (B,) or broadcastable to (B,). Returns (B, dim); dim must be even.
+    """
+    if dim % 2 != 0:
+        raise ValueError(f"cond_dim must be even for time embedding, got {dim}")
+    t_flat = t.reshape(-1).float()
+    half = dim // 2
+    device = t_flat.device
+    freqs = torch.exp(
+        -math.log(10_000.0) * torch.arange(half, device=device, dtype=torch.float32) / max(half - 1, 1)
+    )
+    angles = t_flat[:, None] * freqs[None, :]
+    emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+    return emb.to(dtype=t.dtype)
+
+
 class ConditionalUNet2D(nn.Module):
     """
     Small class-conditional U-Net backbone for image generation experiments.
+
+    Optional continuous time ``t`` is embedded (sinusoidal + MLP) and added to
+    the label embedding so every ``ConditionalResidualBlock2d`` gets FiLM from
+    both class and time. Pass ``t=None`` for time-agnostic use (e.g. EqM).
     """
 
     def __init__(
@@ -34,6 +58,11 @@ class ConditionalUNet2D(nn.Module):
         self.null_class_idx = num_classes
 
         self.label_embedding = nn.Embedding(num_classes + 1, cond_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(cond_dim, cond_dim),
+            nn.SiLU(),
+            nn.Linear(cond_dim, cond_dim),
+        )
         self.in_conv = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
 
         widths = [base_channels * mult for mult in channel_mults]
@@ -63,9 +92,6 @@ class ConditionalUNet2D(nn.Module):
         self.out_act = nn.SiLU()
         self.out_conv = nn.Conv2d(cur_channels, out_channels, kernel_size=3, padding=1)
 
-        self._init_weights()
-
-    def _init_weights(self) -> None:
         init_conv_modules(self)
 
     def _encode_labels(self, y: torch.Tensor | None, batch_size: int, device: torch.device) -> torch.Tensor:
@@ -73,8 +99,16 @@ class ConditionalUNet2D(nn.Module):
             y = torch.full((batch_size,), self.null_class_idx, device=device, dtype=torch.long)
         return self.label_embedding(y)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor | None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor | None,
+        t: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         cond = self._encode_labels(y, x.shape[0], x.device)
+        if t is not None:
+            te = sinusoidal_time_embedding(t, self.cond_dim)
+            cond = cond + self.time_mlp(te.to(dtype=cond.dtype))
         h = self.in_conv(x)
         skips: list[torch.Tensor] = []
         for idx, block in enumerate(self.down_blocks):

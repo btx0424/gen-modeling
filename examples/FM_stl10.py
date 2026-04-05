@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,7 +24,6 @@ from gen_modeling.flow_matching import (
     PredictionType,
     LossType,
     prediction_wrapper_class,
-    update_ema,
 )
 from gen_modeling.modules import ConditionalUNet2D
 
@@ -34,13 +32,12 @@ from gen_modeling.modules import ConditionalUNet2D
 class Config:
     data_root: str = "./data"
     split: str = "train"
-    batch_size: int = 32
+    batch_size: int = 64
     base_channels: int = 64
     num_threads: int = 1
     seed: int = 42
     train_epochs: int = 20
     lr: float = 3e-4
-    ema_decay: float = 0.999
     noise_scale: float = 1.0
     t_eps: float = 1e-2
     sample_steps: int = 80
@@ -61,7 +58,7 @@ class ImageFlowUNet(nn.Module):
             STL10Dataset.info.width,
         )
         self.backbone = ConditionalUNet2D(
-            in_channels=STL10Dataset.info.channels + 1,
+            in_channels=STL10Dataset.info.channels,
             out_channels=STL10Dataset.info.channels,
             num_classes=num_classes,
             base_channels=base_channels,
@@ -71,8 +68,7 @@ class ImageFlowUNet(nn.Module):
     def forward(
         self, x_t: torch.Tensor, t: torch.Tensor, y: torch.Tensor | None
     ) -> torch.Tensor:
-        t_map = t.reshape(-1, 1, 1, 1).expand(-1, 1, x_t.shape[-2], x_t.shape[-1])
-        return self.backbone(torch.cat([x_t, t_map], dim=1), y)
+        return self.backbone(x_t, y, t)
 
 
 def build_model(config: Config) -> nn.Module:
@@ -146,7 +142,6 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--train-epochs", type=int, default=Config.train_epochs)
     parser.add_argument("--lr", type=float, default=Config.lr)
-    parser.add_argument("--ema-decay", type=float, default=Config.ema_decay)
     parser.add_argument("--noise-scale", type=float, default=Config.noise_scale)
     parser.add_argument("--t-eps", type=float, default=Config.t_eps)
     parser.add_argument("--sample-steps", type=int, default=Config.sample_steps)
@@ -160,6 +155,11 @@ def main() -> None:
     )
     parser.add_argument("--pred-type", choices=["x", "eps", "v"], default=Config.pred_type)
     parser.add_argument("--loss-type", choices=["x", "eps", "v"], default=Config.loss_type)
+    parser.add_argument(
+        "--no-compile",
+        action="store_true",
+        help="Disable torch.compile (debugging or environments with inductor issues).",
+    )
     args = parser.parse_args()
 
     config = Config(
@@ -171,7 +171,6 @@ def main() -> None:
         seed=args.seed,
         train_epochs=args.train_epochs,
         lr=args.lr,
-        ema_decay=args.ema_decay,
         noise_scale=args.noise_scale,
         t_eps=args.t_eps,
         sample_steps=args.sample_steps,
@@ -192,8 +191,9 @@ def main() -> None:
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
 
     model = build_model(config).to(device)
-    ema_model = deepcopy(model).to(device)
-    ema_model.eval()
+    if not args.no_compile:
+        torch.set_float32_matmul_precision('high')
+        model = torch.compile(model)
     flow = LinearFlow(
         model,
         noise_scale=config.noise_scale,
@@ -201,14 +201,6 @@ def main() -> None:
         t_eps=config.t_eps,
         conditional=True,
         class_dropout_prob=config.class_dropout_prob,
-    )
-    ema_flow = LinearFlow(
-        ema_model,
-        noise_scale=config.noise_scale,
-        loss_type=config.loss_type,
-        t_eps=config.t_eps,
-        conditional=True,
-        class_dropout_prob=0.0,
     )
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
     out_dir = Path(__file__).resolve().parent / "outputs" / "FM_stl10"
@@ -224,13 +216,13 @@ def main() -> None:
             loss = flow.compute_loss(x, y)
             loss.backward()
             optimizer.step()
-            update_ema(ema_model, model, config.ema_decay)
             last_loss = loss
             pbar.set_postfix(loss=f"{loss.item():.5f}")
 
         epoch_grid = out_dir / f"fm_stl10_epoch_{epoch:03d}.png"
         epoch_metrics = out_dir / f"fm_stl10_epoch_{epoch:03d}.json"
-        metrics = sample_and_save(ema_flow, config, device, epoch_grid, epoch_metrics)
+        model.eval()
+        metrics = sample_and_save(flow, config, device, epoch_grid, epoch_metrics)
         if last_loss is not None:
             print(
                 f"epoch {epoch}: "
@@ -240,7 +232,8 @@ def main() -> None:
 
     out = out_dir / "fm_stl10_samples.png"
     metrics_path = out_dir / "fm_stl10_metrics.json"
-    metrics = sample_and_save(ema_flow, config, device, out, metrics_path)
+    model.eval()
+    metrics = sample_and_save(flow, config, device, out, metrics_path)
     print(json.dumps(metrics, indent=2))
     print("Saved per-epoch STL-10 samples and final metrics under examples/outputs")
     print(f"Saved plot to {out}")
