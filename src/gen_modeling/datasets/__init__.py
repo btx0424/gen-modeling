@@ -1,4 +1,4 @@
-from .images import MNISTDataset
+from .images import MNISTDataset, STL10Dataset
 from .synthetic import (
     CheckerboardDataset,
     GaussianMixtureDataset,
@@ -12,6 +12,7 @@ __all__ = [
     "GaussianMixtureDataset",
     "MNISTDataset",
     "MoonsDataset",
+    "STL10Dataset",
     "SwissRollDataset",
     "SyntheticAmbientDataset",
 ]
