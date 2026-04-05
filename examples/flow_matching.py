@@ -13,7 +13,12 @@ from typing import Literal
 import matplotlib.pyplot as plt
 import wandb
 from gen_modeling.utils.running_stats import RunningNormalizationStats
-from gen_modeling.datasets.synthetic import SwissRollDataset, MoonsDataset
+from gen_modeling.datasets.synthetic import (
+    CheckerboardDataset,
+    MoonsDataset,
+    SwissRollDataset,
+    SyntheticAmbientDataset,
+)
 
 
 class NetworkND(nn.Module):
@@ -169,6 +174,7 @@ class LinearFlow:
 DATASET_CLASSES = {
     "swiss_roll": SwissRollDataset,
     "moons": MoonsDataset,
+    "checkerboard": CheckerboardDataset,
     # "mnist": MNIST,
 }
 
@@ -176,7 +182,7 @@ DATASET_CLASSES = {
 def visualize_data_vs_samples(
     data: torch.Tensor,
     samples: torch.Tensor,
-    Q: torch.Tensor,
+    dataset: SyntheticAmbientDataset,
     out_path: Path,
     *,
     max_points: int = 4000,
@@ -184,14 +190,12 @@ def visualize_data_vs_samples(
     seed: int = 0,
 ) -> bytes:
     """
-    Project ambient points x to intrinsic coordinates z with z = x @ Q, matching the dataset
-    construction x = z @ Q.T (Q has orthonormal columns). No PCA.
+    Plot data vs samples in intrinsic coordinates via ``dataset.unproject`` (z = x @ Q).
     """
-    Q = Q.detach().cpu()
     data = data.detach().cpu()
     samples = samples.detach().cpu()
-    z_data = (data @ Q).numpy()
-    z_samp = (samples @ Q).numpy()
+    z_data = dataset.unproject(data).detach().numpy()
+    z_samp = dataset.unproject(samples).detach().numpy()
 
     n_data = min(z_data.shape[0], max_points)
     n_samp = min(z_samp.shape[0], max_points)
@@ -201,7 +205,7 @@ def visualize_data_vs_samples(
     z_data = z_data[di.numpy()]
     z_samp = z_samp[si.numpy()]
 
-    d = Q.shape[1]
+    d = dataset.intrinsic_dim
     if d == 2:
         fig, ax = plt.subplots(figsize=(6.5, 6.5))
         ax.scatter(
@@ -385,7 +389,7 @@ def main() -> None:
             png = visualize_data_vs_samples(
                 dataset.data,
                 generated,
-                dataset.Q,
+                dataset,
                 out_path=path_epoch,
                 title=title,
                 seed=epoch,

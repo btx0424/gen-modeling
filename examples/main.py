@@ -10,7 +10,13 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from gen_modeling.datasets.synthetic import MoonsDataset, SwissRollDataset
+from gen_modeling.datasets.synthetic import (
+    CheckerboardDataset,
+    GaussianMixtureDataset,
+    MoonsDataset,
+    SwissRollDataset,
+    SyntheticAmbientDataset,
+)
 
 torch.set_float32_matmul_precision("high")
 
@@ -30,7 +36,9 @@ class Config:
     ambient_dim: int = 32
     n_points: int = 8192
     batch_size: int = 1024
-    data_type: Literal["swiss_roll", "moons"] = "swiss_roll"
+    data_type: Literal[
+        "swiss_roll", "moons", "gaussian_mixture", "checkerboard"
+    ] = "gaussian_mixture"
     loss_type: LossType = "x"
     train_steps: int = 500
     hidden_dim: int = 256
@@ -44,7 +52,7 @@ class Config:
 class DataBundle:
     data_ambient: torch.Tensor
     dataloader: DataLoader
-    projection: torch.Tensor
+    dataset: SyntheticAmbientDataset
 
 
 @dataclass
@@ -67,31 +75,28 @@ DEFAULT_EXPERIMENTS: list[tuple[ModelArch, PredictionType]] = [
 ]
 
 
-def project_to_intrinsic(x_ambient: torch.Tensor, projection: torch.Tensor) -> torch.Tensor:
-    return x_ambient @ projection
-
-
-def intrinsic_dim(projection: torch.Tensor) -> int:
-    return int(projection.shape[1])
-
-
 def prepare_data(config: Config, device: torch.device) -> DataBundle:
-    dataset_cls = {
-        "swiss_roll": SwissRollDataset,
-        "moons": MoonsDataset,
-    }[config.data_type]
-    dataset = dataset_cls(
+    common = dict(
         ambient_dim=config.ambient_dim,
         n_samples=config.n_points,
-        noise=0.05,
         device=str(device),
         random_state=config.seed,
     )
+    if config.data_type == "swiss_roll":
+        dataset = SwissRollDataset(noise=0.05, **common)
+    elif config.data_type == "moons":
+        dataset = MoonsDataset(noise=0.05, **common)
+    elif config.data_type == "gaussian_mixture":
+        dataset = GaussianMixtureDataset(scale_range=(0.04, 0.12), **common)
+    elif config.data_type == "checkerboard":
+        dataset = CheckerboardDataset(noise=2.0, jitter=0.03, **common)
+    else:
+        raise ValueError(f"unknown data_type: {config.data_type}")
     dataloader = DataLoader(dataset, batch_size=config.batch_size)
     return DataBundle(
         data_ambient=dataset.data,
         dataloader=dataloader,
-        projection=dataset.Q,
+        dataset=dataset,
     )
 
 
@@ -269,8 +274,8 @@ def plot_intrinsic_scatter(
         ax.scatter(data_intrinsic[:, 0], data_intrinsic[:, 1], s=5, c="black", alpha=0.2, label="data")
         if samples_intrinsic is not None:
             ax.scatter(samples_intrinsic[:, 0], samples_intrinsic[:, 1], s=5, alpha=0.35, label="generated")
-        ax.set_xlim(-1.5, 1.5)
-        ax.set_ylim(-1.5, 1.5)
+        ax.set_xlim(-2.75, 2.75)
+        ax.set_ylim(-2.75, 2.75)
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel(r"$z_1$")
         ax.set_ylabel(r"$z_2$")
@@ -307,9 +312,9 @@ def plot_intrinsic_scatter(
         ax.legend(loc="best")
 
 
-def plot_data(data_ambient: torch.Tensor, projection: torch.Tensor) -> None:
-    data_intrinsic = project_to_intrinsic(data_ambient, projection).detach().cpu().numpy()
-    dim = intrinsic_dim(projection)
+def plot_data(dataset: SyntheticAmbientDataset) -> None:
+    data_intrinsic = dataset.unproject(dataset.data).detach().cpu().numpy()
+    dim = dataset.intrinsic_dim
     fig = plt.figure(figsize=(7.5, 6.5) if dim == 3 else (6, 6))
     ax = fig.add_subplot(111, projection="3d" if dim == 3 else None)
     plot_intrinsic_scatter(ax, data_intrinsic, title="Ground Truth")
@@ -336,11 +341,11 @@ def save_experiment_visualizations(
 ) -> None:
     output_dir = Path(config.experiment_output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    data_intrinsic = project_to_intrinsic(data_bundle.data_ambient, data_bundle.projection).detach().cpu().numpy()
+    data_intrinsic = data_bundle.dataset.unproject(data_bundle.data_ambient).detach().cpu().numpy()
 
     for (model_arch, pred_type), result in results.items():
-        samples_intrinsic = project_to_intrinsic(result.samples_ambient, data_bundle.projection).detach().cpu().numpy()
-        dim = intrinsic_dim(data_bundle.projection)
+        samples_intrinsic = data_bundle.dataset.unproject(result.samples_ambient).detach().cpu().numpy()
+        dim = data_bundle.dataset.intrinsic_dim
         fig = plt.figure(figsize=(7.5, 6.5) if dim == 3 else (6.5, 6.5))
         ax = fig.add_subplot(111, projection="3d" if dim == 3 else None)
         plot_intrinsic_scatter(
@@ -361,13 +366,13 @@ def plot_samples(
     experiments: list[tuple[ModelArch, PredictionType]],
 ) -> None:
     x_preds = {
-        key: project_to_intrinsic(result.samples_ambient, data_bundle.projection).detach().cpu().numpy()
+        key: data_bundle.dataset.unproject(result.samples_ambient).detach().cpu().numpy()
         for key, result in results.items()
     }
-    data_intrinsic = project_to_intrinsic(data_bundle.data_ambient, data_bundle.projection).detach().cpu().numpy()
+    data_intrinsic = data_bundle.dataset.unproject(data_bundle.data_ambient).detach().cpu().numpy()
     model_arches = list(dict.fromkeys([arch for arch, _ in experiments]))
     cols = ["original", "x", "eps", "v"]
-    dim = intrinsic_dim(data_bundle.projection)
+    dim = data_bundle.dataset.intrinsic_dim
     fig = plt.figure(figsize=(24, 6 * len(model_arches) if dim == 3 else 5 * len(model_arches)))
     axes: list[list[plt.Axes]] = []
     for row_idx in range(len(model_arches)):
@@ -407,7 +412,7 @@ def main() -> None:
     print(f"Running on {device} with Ambient Dimension D={config.ambient_dim}")
 
     data_bundle = prepare_data(config, device)
-    plot_data(data_bundle.data_ambient, data_bundle.projection)
+    plot_data(data_bundle.dataset)
 
     results: dict[tuple[ModelArch, PredictionType], ExperimentResult] = {}
     for model_arch, pred_type in DEFAULT_EXPERIMENTS:

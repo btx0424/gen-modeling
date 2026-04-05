@@ -13,3 +13,7 @@ wheels/
 outputs/
 wandb/
 artifacts/
+assets/
+
+# data
+data/
