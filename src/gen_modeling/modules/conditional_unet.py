@@ -3,49 +3,12 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-class ConditionalResBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, cond_dim: int) -> None:
-        super().__init__()
-        groups_in = min(8, in_channels)
-        groups_out = min(8, out_channels)
-        self.norm1 = nn.GroupNorm(groups_in, in_channels)
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.norm2 = nn.GroupNorm(groups_out, out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.cond_proj = nn.Linear(cond_dim, 2 * out_channels)
-        self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
-        self.act = nn.SiLU()
-
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(self.act(self.norm1(x)))
-        scale, shift = self.cond_proj(cond).chunk(2, dim=-1)
-        scale = scale[:, :, None, None]
-        shift = shift[:, :, None, None]
-        h = self.norm2(h)
-        h = h * (1.0 + scale) + shift
-        h = self.conv2(self.act(h))
-        return h + self.skip(x)
-
-
-class Downsample(nn.Module):
-    def __init__(self, channels: int) -> None:
-        super().__init__()
-        self.conv = nn.Conv2d(channels, channels, kernel_size=3, stride=2, padding=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
-
-
-class Upsample(nn.Module):
-    def __init__(self, channels: int) -> None:
-        super().__init__()
-        self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.interpolate(x, scale_factor=2.0, mode="nearest")
-        return self.conv(x)
+from .cnn import (
+    ConditionalResidualBlock2d,
+    Downsample2d,
+    PixelShuffleUpsample2d,
+    init_conv_modules,
+)
 
 
 class ConditionalUNet2D(nn.Module):
@@ -79,22 +42,22 @@ class ConditionalUNet2D(nn.Module):
 
         cur_channels = base_channels
         for idx, width in enumerate(widths):
-            self.down_blocks.append(ConditionalResBlock(cur_channels, width, cond_dim))
+            self.down_blocks.append(ConditionalResidualBlock2d(cur_channels, width, cond_dim))
             cur_channels = width
             if idx < len(widths) - 1:
-                self.downsamples.append(Downsample(cur_channels))
+                self.downsamples.append(Downsample2d(cur_channels))
 
-        self.mid_block1 = ConditionalResBlock(cur_channels, cur_channels, cond_dim)
-        self.mid_block2 = ConditionalResBlock(cur_channels, cur_channels, cond_dim)
+        self.mid_block1 = ConditionalResidualBlock2d(cur_channels, cur_channels, cond_dim)
+        self.mid_block2 = ConditionalResidualBlock2d(cur_channels, cur_channels, cond_dim)
 
         self.up_blocks = nn.ModuleList()
         self.upsamples = nn.ModuleList()
         for idx in range(len(widths) - 1, -1, -1):
             skip_channels = widths[idx]
-            self.up_blocks.append(ConditionalResBlock(cur_channels + skip_channels, skip_channels, cond_dim))
+            self.up_blocks.append(ConditionalResidualBlock2d(cur_channels + skip_channels, skip_channels, cond_dim))
             cur_channels = skip_channels
             if idx > 0:
-                self.upsamples.append(Upsample(cur_channels))
+                self.upsamples.append(PixelShuffleUpsample2d(cur_channels))
 
         self.out_norm = nn.GroupNorm(min(8, cur_channels), cur_channels)
         self.out_act = nn.SiLU()
@@ -103,16 +66,7 @@ class ConditionalUNet2D(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        nn.init.normal_(self.label_embedding.weight, mean=0.0, std=0.02)
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.orthogonal_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Linear):
-                nn.init.orthogonal_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        init_conv_modules(self)
 
     def _encode_labels(self, y: torch.Tensor | None, batch_size: int, device: torch.device) -> torch.Tensor:
         if y is None:
