@@ -192,7 +192,7 @@ def main() -> None:
     ema_model = deepcopy(model).to(device)
     ema_model.eval()
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
-    out_dir = Path(__file__).resolve().parent / "outputs"
+    out_dir = Path(__file__).resolve().parent / "outputs" / "EqM_mnist"
 
     for epoch in range(config.train_epochs):
         model.train()

@@ -299,7 +299,7 @@ def main() -> None:
     flow = LinearFlow(model, noise_scale=config.noise_scale, loss_type=config.loss_type, t_eps=config.t_eps)
     ema_flow = LinearFlow(ema_model, noise_scale=config.noise_scale, loss_type=config.loss_type, t_eps=config.t_eps)
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
-    out_dir = Path(__file__).resolve().parent / "outputs"
+    out_dir = Path(__file__).resolve().parent / "outputs" / "FM_mnist"
 
     for epoch in range(config.train_epochs):
         model.train()
