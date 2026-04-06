@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from itertools import cycle
 from pathlib import Path
 from typing import Literal
-from copy import deepcopy
 
 import matplotlib.pyplot as plt
 import torch
@@ -46,7 +45,6 @@ class Config:
     seed: int = 42
     train_steps: int = 6000
     lr: float = 5e-4
-    ema_decay: float = 0.999
     sample_steps: int = 100
     sample_stepsize: float = 0.01
     sample_sampler: Literal["gd", "nag"] = "nag"
@@ -123,19 +121,6 @@ def eqm_ct(a: float = 0.8, grad_scale: float = 4.0):
     def func(t: torch.Tensor) -> torch.Tensor:
         return grad_scale * torch.where(t < a, 1.0, (1.0 - t) / (1.0 - a))
     return func
-
-
-@torch.no_grad()
-def update_ema(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
-    ema_params = dict(ema_model.named_parameters())
-    model_params = dict(model.named_parameters())
-    for name, param in model_params.items():
-        ema_params[name].mul_(decay).add_(param.data, alpha=1.0 - decay)
-
-    ema_buffers = dict(ema_model.named_buffers())
-    model_buffers = dict(model.named_buffers())
-    for name, buffer in model_buffers.items():
-        ema_buffers[name].copy_(buffer)
 
 
 @torch.no_grad()
@@ -305,8 +290,6 @@ def main() -> None:
 
     backbone = MLP(config.ambient_dim, config.hidden_dim).to(device)
     model = EqM(backbone, eqm_ct()).to(device)
-    ema_model = deepcopy(model).to(device)
-    ema_model.eval()
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
 
     model.train()
@@ -319,10 +302,9 @@ def main() -> None:
         loss = model.compute_loss(x1)
         loss.backward()
         optimizer.step()
-        update_ema(ema_model, model, config.ema_decay)
         if step % 100 == 0 or step == config.train_steps - 1:
             metrics = compute_subspace_metrics(
-                ema_model.network,
+                model.network,
                 x1,
                 bundle.dataset.Q,
                 model.grad_magnitude,
@@ -336,7 +318,7 @@ def main() -> None:
             pbar.set_postfix(loss=f"{loss.item():.5f}")
 
     n_plot = min(config.num_plot_samples, config.n_points)
-    sample_fn = ema_model.sample_nag if config.sample_sampler == "nag" else ema_model.sample_gd
+    sample_fn = model.sample_nag if config.sample_sampler == "nag" else model.sample_gd
     samples = sample_fn(
         num_samples=n_plot,
         device=device,
@@ -349,13 +331,13 @@ def main() -> None:
     out = Path(__file__).resolve().parent / "outputs" / "eqm_intrinsic.png"
     _plot_intrinsic_comparison(data_z, samples_z, out)
     final_metrics = compute_subspace_metrics(
-        ema_model.network,
+        model.network,
         bundle.data_ambient[: min(config.batch_size, config.n_points)],
         bundle.dataset.Q,
         model.grad_magnitude,
     )
     print(
-        "Final EMA metrics: "
+        "Final metrics: "
         f"loss={final_metrics['loss']:.6f}, "
         f"intrinsic_mse={final_metrics['intrinsic_mse']:.6f}, "
         f"orthogonal_mse={final_metrics['orthogonal_mse']:.6f}"
