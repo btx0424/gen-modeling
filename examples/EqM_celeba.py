@@ -112,6 +112,53 @@ def plot_image_grid(
     plt.close(fig)
 
 
+def _checkpoint_path(out_dir: Path) -> Path:
+    return out_dir / "training_checkpoint.pt"
+
+
+def save_training_checkpoint(
+    path: Path,
+    *,
+    epoch: int,
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "torch_rng": torch.get_rng_state(),
+        "numpy_rng": np.random.get_state(),
+    }
+    if torch.cuda.is_available():
+        payload["cuda_rng"] = torch.cuda.get_rng_state_all()
+    torch.save(payload, path)
+
+
+def try_resume_training(
+    path: Path,
+    *,
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+) -> int:
+    """Load checkpoint if present. Returns epoch index to start training from (0 = fresh)."""
+    if not path.is_file():
+        return 0
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    if "torch_rng" in ckpt:
+        tr = ckpt["torch_rng"]
+        torch.set_rng_state(tr.cpu() if tr.device.type != "cpu" else tr)
+    if "numpy_rng" in ckpt:
+        np.random.set_state(ckpt["numpy_rng"])
+    if "cuda_rng" in ckpt and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(ckpt["cuda_rng"])
+    return int(ckpt["epoch"]) + 1
+
+
 def sample_and_save(
     model: EqM,
     config: Config,
@@ -161,6 +208,11 @@ def main() -> None:
     parser.add_argument("--sample-sampler", choices=["gd", "nag"], default=Config.sample_sampler)
     parser.add_argument("--sample-mu", type=float, default=Config.sample_mu)
     parser.add_argument("--num-plot-samples", type=int, default=Config.num_plot_samples)
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Do not load training_checkpoint.pt from the output directory even if it exists.",
+    )
     args = parser.parse_args()
 
     config = Config(
@@ -185,7 +237,7 @@ def main() -> None:
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     dataset = CelebADataset(config.data_root, split=config.split, download=True, normalize=True)
-    loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+    loader = DataLoader(dataset, num_workers=2, batch_size=config.batch_size, shuffle=True)
 
     model = EqM(
         network=ConditionalUNet2D(
@@ -199,8 +251,16 @@ def main() -> None:
     ).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=config.lr)
     out_dir = Path(__file__).resolve().parent / "outputs" / "EqM_celeba"
+    ckpt_path = _checkpoint_path(out_dir)
+    start_epoch = 0
+    if not args.no_resume:
+        start_epoch = try_resume_training(
+            ckpt_path, model=model, optimizer=optimizer, device=device
+        )
+        if start_epoch > 0:
+            print(f"Resumed from {ckpt_path}; starting at epoch {start_epoch}")
 
-    for epoch in range(config.train_epochs):
+    for epoch in range(start_epoch, config.train_epochs):
         model.train()
         pbar = tqdm(loader, desc=f"epoch {epoch}")
         losses = []
@@ -229,6 +289,9 @@ def main() -> None:
                 f"loss={np.mean(losses):.6f}, "
                 f"sample_std={metrics['sample_std']:.6f}"
             )
+        save_training_checkpoint(
+            ckpt_path, epoch=epoch, model=model, optimizer=optimizer
+        )
 
     out = out_dir / "eqm_celeba_samples.png"
     metrics_path = out_dir / "eqm_celeba_metrics.json"

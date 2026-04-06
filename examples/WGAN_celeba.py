@@ -1,5 +1,5 @@
 """
-Class-conditional WGAN-GP on STL-10.
+Unconditional WGAN-GP on CelebA.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from gen_modeling.datasets.images import ImageDatasetInfo, STL10Dataset, tensor_batch_to_display
+from gen_modeling.datasets.images import CelebADataset, ImageDatasetInfo, tensor_batch_to_display
 from gen_modeling.modules.cnn import (
     Downsample2d,
     PixelShuffleUpsample2d,
@@ -59,21 +59,21 @@ class GeneratorBlock(nn.Module):
         return self.post(x)
 
 
-class ConditionalGenerator(nn.Module):
+class Generator(nn.Module):
     def __init__(
         self,
         latent_dim: int,
         base_channels: int,
-        num_classes: int,
         *,
         data_info: ImageDatasetInfo,
     ) -> None:
         super().__init__()
-        self.label_embedding = nn.Embedding(num_classes, latent_dim)
-        upsample_factor = 2 ** 3
+        upsample_factor = 2**3
         self._seed_h = data_info.height // upsample_factor
         self._seed_w = data_info.width // upsample_factor
-        self.to_seed = nn.Linear(latent_dim * 2, base_channels * 4 * self._seed_h * self._seed_w)
+        self.to_seed = nn.Linear(
+            latent_dim, base_channels * 4 * self._seed_h * self._seed_w
+        )
         self.up1 = GeneratorBlock(base_channels * 4, base_channels * 2)
         self.up2 = GeneratorBlock(base_channels * 2, base_channels)
         self.up3 = GeneratorBlock(base_channels, base_channels)
@@ -82,9 +82,8 @@ class ConditionalGenerator(nn.Module):
         self.sample_shape = (data_info.channels, data_info.height, data_info.width)
         init_conv_modules(self)
 
-    def forward(self, z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        cond = torch.cat([z, self.label_embedding(y)], dim=-1)
-        h = self.to_seed(cond).reshape(z.shape[0], -1, self._seed_h, self._seed_w)
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        h = self.to_seed(z).reshape(z.shape[0], -1, self._seed_h, self._seed_w)
         h = self.up1(h)
         h = self.up2(h)
         h = self.up3(h)
@@ -101,8 +100,8 @@ class CriticBlock(nn.Module):
         return self.down(self.block(x))
 
 
-class ProjectionCritic(nn.Module):
-    def __init__(self, base_channels: int, num_classes: int, *, data_info: ImageDatasetInfo) -> None:
+class Critic(nn.Module):
+    def __init__(self, base_channels: int, *, data_info: ImageDatasetInfo) -> None:
         super().__init__()
         in_channels = data_info.channels
         self.stem = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
@@ -111,7 +110,6 @@ class ProjectionCritic(nn.Module):
         self.down3 = CriticBlock(base_channels * 2, base_channels * 4)
         self.mid = ResidualBlock2d(base_channels * 4, base_channels * 4)
         self.score_head = nn.Linear(base_channels * 4, 1)
-        self.class_embed = nn.Embedding(num_classes, base_channels * 4)
         init_conv_modules(self)
 
     def features(self, x: torch.Tensor) -> torch.Tensor:
@@ -122,10 +120,8 @@ class ProjectionCritic(nn.Module):
         h = self.mid(h)
         return h.mean(dim=(2, 3))
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        feat = self.features(x)
-        proj = (feat * self.class_embed(y)).sum(dim=-1, keepdim=True)
-        return self.score_head(feat) + proj
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.score_head(self.features(x))
 
 
 @torch.no_grad()
@@ -141,15 +137,14 @@ def update_ema(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
 
 
 def gradient_penalty(
-    critic: ProjectionCritic,
+    critic: Critic,
     real: torch.Tensor,
     fake: torch.Tensor,
-    labels: torch.Tensor,
 ) -> torch.Tensor:
     alpha = torch.rand(real.shape[0], 1, 1, 1, device=real.device, dtype=real.dtype)
     assert real.shape == fake.shape, f"Real shape: {real.shape}, fake shape: {fake.shape}"
     interpolated = (alpha * real + (1.0 - alpha) * fake).requires_grad_(True)
-    score = critic(interpolated, labels)
+    score = critic(interpolated)
     grad = torch.autograd.grad(
         outputs=score.sum(),
         inputs=interpolated,
@@ -161,43 +156,91 @@ def gradient_penalty(
     return ((grad.norm(2, dim=1) - 1.0) ** 2).mean()
 
 
-def make_eval_labels(num_samples: int, num_classes: int, device: torch.device) -> torch.Tensor:
-    labels = torch.arange(num_classes, device=device, dtype=torch.long)
-    repeats = (num_samples + num_classes - 1) // num_classes
-    return labels.repeat(repeats)[:num_samples]
-
-
-def plot_stl10_grid(
+def plot_image_grid(
     samples: torch.Tensor,
-    labels: torch.Tensor,
     path: Path,
     *,
     num_show: int,
-    num_classes: int,
     data_info: ImageDatasetInfo,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     samples = tensor_batch_to_display(samples[:num_show], data_info)
-    labels = labels[:num_show].detach().cpu()
-    n_cols = num_classes
+    n_cols = int(np.ceil(np.sqrt(samples.shape[0])))
     n_rows = int(np.ceil(samples.shape[0] / n_cols))
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(1.6 * n_cols, 1.6 * n_rows))
     axes = np.asarray(axes).reshape(-1)
-    for idx, (ax, image) in enumerate(zip(axes, samples, strict=False)):
+    for ax, image in zip(axes, samples, strict=False):
         ax.imshow(image.permute(1, 2, 0).numpy())
         ax.axis("off")
-        ax.set_title(str(int(labels[idx].item())), fontsize=8, pad=1)
-    for ax in axes[samples.shape[0]:]:
+    for ax in axes[samples.shape[0] :]:
         ax.axis("off")
     plt.tight_layout(pad=0.08)
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
 
+def _checkpoint_path(out_dir: Path) -> Path:
+    return out_dir / "training_checkpoint.pt"
+
+
+def save_training_checkpoint(
+    path: Path,
+    *,
+    epoch: int,
+    generator: nn.Module,
+    critic: nn.Module,
+    generator_ema: nn.Module,
+    g_opt: optim.Optimizer,
+    d_opt: optim.Optimizer,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "epoch": epoch,
+        "generator": generator.state_dict(),
+        "critic": critic.state_dict(),
+        "generator_ema": generator_ema.state_dict(),
+        "g_opt": g_opt.state_dict(),
+        "d_opt": d_opt.state_dict(),
+        "torch_rng": torch.get_rng_state(),
+        "numpy_rng": np.random.get_state(),
+    }
+    if torch.cuda.is_available():
+        payload["cuda_rng"] = torch.cuda.get_rng_state_all()
+    torch.save(payload, path)
+
+
+def try_resume_training(
+    path: Path,
+    *,
+    generator: nn.Module,
+    critic: nn.Module,
+    generator_ema: nn.Module,
+    g_opt: optim.Optimizer,
+    d_opt: optim.Optimizer,
+    device: torch.device,
+) -> int:
+    """Load checkpoint if present. Returns epoch index to start training from (0 = fresh)."""
+    if not path.is_file():
+        return 0
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    generator.load_state_dict(ckpt["generator"])
+    critic.load_state_dict(ckpt["critic"])
+    generator_ema.load_state_dict(ckpt["generator_ema"])
+    g_opt.load_state_dict(ckpt["g_opt"])
+    d_opt.load_state_dict(ckpt["d_opt"])
+    if "torch_rng" in ckpt:
+        tr = ckpt["torch_rng"]
+        torch.set_rng_state(tr.cpu() if tr.device.type != "cpu" else tr)
+    if "numpy_rng" in ckpt:
+        np.random.set_state(ckpt["numpy_rng"])
+    if "cuda_rng" in ckpt and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(ckpt["cuda_rng"])
+    return int(ckpt["epoch"]) + 1
+
+
 @torch.no_grad()
 def sample_and_save(
-    generator: ConditionalGenerator,
-    num_classes: int,
+    generator: Generator,
     config: Config,
     device: torch.device,
     out_path: Path,
@@ -205,15 +248,12 @@ def sample_and_save(
     *,
     data_info: ImageDatasetInfo,
 ) -> dict[str, float]:
-    labels = make_eval_labels(config.num_plot_samples, num_classes, device)
-    z = torch.randn(labels.shape[0], config.latent_dim, device=device)
-    samples = generator(z, labels)
-    plot_stl10_grid(
+    z = torch.randn(config.num_plot_samples, config.latent_dim, device=device)
+    samples = generator(z)
+    plot_image_grid(
         samples,
-        labels,
         out_path,
         num_show=config.num_plot_samples,
-        num_classes=num_classes,
         data_info=data_info,
     )
     metrics = {
@@ -228,7 +268,7 @@ def sample_and_save(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Conditional WGAN-GP on STL-10.")
+    parser = argparse.ArgumentParser(description="Unconditional WGAN-GP on CelebA.")
     parser.add_argument("--data-root", type=str, default=Config.data_root)
     parser.add_argument("--split", type=str, default=Config.split)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
@@ -244,6 +284,11 @@ def main() -> None:
     parser.add_argument("--critic-steps", type=int, default=Config.critic_steps)
     parser.add_argument("--gp-lambda", type=float, default=Config.gp_lambda)
     parser.add_argument("--num-plot-samples", type=int, default=Config.num_plot_samples)
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Do not load training_checkpoint.pt from the output directory even if it exists.",
+    )
     args = parser.parse_args()
 
     config = Config(
@@ -269,28 +314,39 @@ def main() -> None:
     np.random.seed(config.seed)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    dataset = STL10Dataset(config.data_root, split=config.split, download=True, normalize=True)
-    loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, drop_last=True)
+    dataset = CelebADataset(config.data_root, split=config.split, download=True, normalize=True)
+    loader = DataLoader(
+        dataset, num_workers=2, batch_size=config.batch_size, shuffle=True, drop_last=True
+    )
 
-    generator = ConditionalGenerator(
+    generator = Generator(
         config.latent_dim,
         config.base_channels,
-        dataset.info.num_classes,
         data_info=dataset.info,
     ).to(device)
     generator_ema = deepcopy(generator).to(device)
     generator_ema.eval()
-    critic = ProjectionCritic(
-        config.base_channels,
-        dataset.info.num_classes,
-        data_info=dataset.info,
-    ).to(device)
+    critic = Critic(config.base_channels, data_info=dataset.info).to(device)
 
     g_opt = optim.Adam(generator.parameters(), lr=config.lr, betas=(config.beta1, config.beta2))
     d_opt = optim.Adam(critic.parameters(), lr=config.lr, betas=(config.beta1, config.beta2))
-    out_dir = Path(__file__).resolve().parent / "outputs" / "WGAN_stl10"
+    out_dir = Path(__file__).resolve().parent / "outputs" / "WGAN_celeba"
+    ckpt_path = _checkpoint_path(out_dir)
+    start_epoch = 0
+    if not args.no_resume:
+        start_epoch = try_resume_training(
+            ckpt_path,
+            generator=generator,
+            critic=critic,
+            generator_ema=generator_ema,
+            g_opt=g_opt,
+            d_opt=d_opt,
+            device=device,
+        )
+        if start_epoch > 0:
+            print(f"Resumed from {ckpt_path}; starting at epoch {start_epoch}")
 
-    for epoch in range(config.train_epochs):
+    for epoch in range(start_epoch, config.train_epochs):
         generator.train()
         critic.train()
         pbar = tqdm(loader, desc=f"epoch {epoch}")
@@ -298,17 +354,16 @@ def main() -> None:
         last_d_loss = None
         last_wdist = None
         last_gp = None
-        for step, (real, labels) in enumerate(pbar):
+        for step, (real, _) in enumerate(pbar):
             real = real.to(device)
-            labels = labels.to(device)
 
             z = torch.randn(real.shape[0], config.latent_dim, device=device)
-            fake = generator(z, labels)
+            fake = generator(z)
 
             d_opt.zero_grad(set_to_none=True)
-            real_score = critic(real, labels)
-            fake_score = critic(fake.detach(), labels)
-            gp = gradient_penalty(critic, real, fake.detach(), labels)
+            real_score = critic(real)
+            fake_score = critic(fake.detach())
+            gp = gradient_penalty(critic, real, fake.detach())
             d_loss = fake_score.mean() - real_score.mean() + config.gp_lambda * gp
             d_loss.backward()
             d_opt.step()
@@ -320,8 +375,8 @@ def main() -> None:
             if (step + 1) % config.critic_steps == 0:
                 g_opt.zero_grad(set_to_none=True)
                 z = torch.randn(real.shape[0], config.latent_dim, device=device)
-                fake = generator(z, labels)
-                g_loss = -critic(fake, labels).mean()
+                fake = generator(z)
+                g_loss = -critic(fake).mean()
                 g_loss.backward()
                 g_opt.step()
                 update_ema(generator_ema, generator, config.ema_decay)
@@ -334,11 +389,11 @@ def main() -> None:
                 g_loss=f"{last_g_loss.item():.5f}" if last_g_loss is not None else "nan",
             )
 
-        epoch_grid = out_dir / f"wgan_stl10_epoch_{epoch:03d}.png"
-        epoch_metrics = out_dir / f"wgan_stl10_epoch_{epoch:03d}.json"
+        epoch_grid = out_dir / f"wgan_celeba_epoch_{epoch:03d}.png"
+        epoch_metrics = out_dir / f"wgan_celeba_epoch_{epoch:03d}.json"
+        generator_ema.eval()
         metrics = sample_and_save(
             generator_ema,
-            dataset.info.num_classes,
             config,
             device,
             epoch_grid,
@@ -353,12 +408,21 @@ def main() -> None:
             f"g_loss={last_g_loss.item() if last_g_loss is not None else float('nan'):.6f}, "
             f"sample_std={metrics['sample_std']:.6f}"
         )
+        save_training_checkpoint(
+            ckpt_path,
+            epoch=epoch,
+            generator=generator,
+            critic=critic,
+            generator_ema=generator_ema,
+            g_opt=g_opt,
+            d_opt=d_opt,
+        )
 
-    out = out_dir / "wgan_stl10_samples.png"
-    metrics_path = out_dir / "wgan_metrics.json"
+    out = out_dir / "wgan_celeba_samples.png"
+    metrics_path = out_dir / "wgan_celeba_metrics.json"
+    generator_ema.eval()
     metrics = sample_and_save(
         generator_ema,
-        dataset.info.num_classes,
         config,
         device,
         out,
@@ -366,7 +430,7 @@ def main() -> None:
         data_info=dataset.info,
     )
     print(json.dumps(metrics, indent=2))
-    print("Saved per-epoch STL-10 samples and final metrics under examples/outputs")
+    print("Saved per-epoch CelebA samples and final metrics under examples/outputs")
     print(f"Saved plot to {out}")
 
 
