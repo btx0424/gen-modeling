@@ -6,6 +6,7 @@ from .synthetic import (
     SwissRollDataset,
     SyntheticAmbientDataset,
 )
+from .robotics import LAFAN1Dataset
 
 __all__ = [
     "CelebADataset",
@@ -18,4 +19,5 @@ __all__ = [
     "SwissRollDataset",
     "tensor_batch_to_display",
     "SyntheticAmbientDataset",
+    "LAFAN1Dataset",
 ]
