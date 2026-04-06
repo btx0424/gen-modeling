@@ -3,8 +3,8 @@ Equilibrium Matching on LAFAN1-style robot trajectories.
 
 This is a scaffold example using the shared 1D conditional U-Net over sequences.
 Inputs and outputs have shape (B, T, C), matching ``LAFAN1Dataset`` windows.
-Conditioning is done by pinning the first state in the trajectory, so the model
-learns to generate the future given the current state.
+Conditioning is done by pinning the first ``k`` timesteps (``--cond-steps``); the model
+is trained to match the flow field on later steps while keeping the prefix fixed.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ class Config:
     data_root: str = "./data"
     robot: RobotName = "g1"
     seq_len: int = 32
+    cond_steps: int = 4
     stride: int = 1
     batch_size: int = 128
     base_channels: int = 128
@@ -77,68 +78,88 @@ class TrajectoryEqMBackbone(nn.Module):
 
 
 class EqM(nn.Module):
-    def __init__(self, network: nn.Module):
+    def __init__(self, network: nn.Module, *, cond_steps: int = 4):
         super().__init__()
+        if cond_steps < 1:
+            raise ValueError("cond_steps must be >= 1")
         self.network = network
+        self.cond_steps = cond_steps
         self.grad_magnitude = eqm_ct()
 
     def compute_loss(self, x1: Float[torch.Tensor, "N seq_len D"]) -> torch.Tensor:
+        k = self.cond_steps
+        if x1.shape[1] < k:
+            raise ValueError(
+                f"sequence length {x1.shape[1]} is shorter than cond_steps={k}"
+            )
         expand_shape = (-1,) + (x1.ndim - 1) * (1,)
         t = torch.rand(x1.shape[0], device=x1.device, dtype=x1.dtype).reshape(expand_shape)
         x0 = torch.randn_like(x1)
         xt = t * x1 + (1.0 - t) * x0
-        first_state = x1[:, 0]
-        xt[:, 0] = first_state
+        prefix = x1[:, :k]
+        xt[:, :k] = prefix
         target = (x1 - x0) * self.grad_magnitude(t)
-        target[:, 0] = 0.0
+        target[:, :k] = 0.0
         pred = self.network(xt)
-        pred[:, 0] = 0.0
+        pred[:, :k] = 0.0
         return ((pred - target) ** 2).mean()
 
     @torch.inference_mode()
     def sample_gd(
         self,
-        first_state: Float[torch.Tensor, "D"],
+        cond_prefix: torch.Tensor,
         seq_len: int,
         device: torch.device,
         *,
         num_steps: int,
         stepsize: float,
-    ) -> Float[torch.Tensor, "N seq_len D"]:
+    ) -> torch.Tensor:
+        k = self.cond_steps
         dtype = next(self.parameters()).dtype
-        num_samples = first_state.shape[0]
+        if cond_prefix.ndim != 3 or cond_prefix.shape[1] != k:
+            raise ValueError(
+                f"cond_prefix must have shape (N, {k}, D), got {tuple(cond_prefix.shape)}"
+            )
+        num_samples = cond_prefix.shape[0]
+        cond_prefix = cond_prefix.to(device=device, dtype=dtype)
         x = torch.randn(num_samples, seq_len, self.network.input_dim, device=device, dtype=dtype)
-        x[:, 0] = first_state.to(device=device, dtype=dtype)
+        x[:, :k] = cond_prefix
         for _ in range(num_steps):
             update = self.network(x)
-            update[:, 0] = 0.0
+            update[:, :k] = 0.0
             x = x + stepsize * update
-            x[:, 0] = first_state.to(device=device, dtype=dtype)
+            x[:, :k] = cond_prefix
         return x
 
     @torch.inference_mode()
     def sample_nag(
         self,
-        first_state: Float[torch.Tensor, "D"],
+        cond_prefix: torch.Tensor,
         seq_len: int,
         device: torch.device,
         *,
         num_steps: int,
         stepsize: float,
         mu: float,
-    ) -> Float[torch.Tensor, "N seq_len D"]:
+    ) -> torch.Tensor:
+        k = self.cond_steps
         dtype = next(self.parameters()).dtype
-        num_samples = first_state.shape[0]
+        if cond_prefix.ndim != 3 or cond_prefix.shape[1] != k:
+            raise ValueError(
+                f"cond_prefix must have shape (N, {k}, D), got {tuple(cond_prefix.shape)}"
+            )
+        num_samples = cond_prefix.shape[0]
+        cond_prefix = cond_prefix.to(device=device, dtype=dtype)
         x = torch.randn(num_samples, seq_len, self.network.input_dim, device=device, dtype=dtype)
-        x[:, 0] = first_state.to(device=device, dtype=dtype)
+        x[:, :k] = cond_prefix
         momentum = torch.zeros_like(x)
         for _ in range(num_steps):
             lookahead = x + stepsize * mu * momentum
-            lookahead[:, 0] = first_state.to(device=device, dtype=dtype)
+            lookahead[:, :k] = cond_prefix
             momentum = self.network(lookahead)
-            momentum[:, 0] = 0.0
+            momentum[:, :k] = 0.0
             x = x + stepsize * momentum
-            x[:, 0] = first_state.to(device=device, dtype=dtype)
+            x[:, :k] = cond_prefix
         return x
 
 
@@ -182,9 +203,10 @@ def sample_and_save(
     metrics_path: Path | None = None,
 ) -> dict[str, float]:
     sample_fn = model.sample_nag if config.sample_sampler == "nag" else model.sample_gd
-    first_state = reference_batch[: config.num_plot_samples, 0].to(device)
+    k = config.cond_steps
+    cond_prefix = reference_batch[: config.num_plot_samples, :k].to(device)
     samples = sample_fn(
-        first_state=first_state,
+        cond_prefix=cond_prefix,
         seq_len=config.seq_len,
         device=device,
         num_steps=config.sample_steps,
@@ -268,6 +290,12 @@ def main() -> None:
     parser.add_argument("--data-root", type=str, default=Config.data_root)
     parser.add_argument("--robot", choices=["g1", "h1", "h1_2"], default=Config.robot)
     parser.add_argument("--seq-len", type=int, default=Config.seq_len)
+    parser.add_argument(
+        "--cond-steps",
+        type=int,
+        default=Config.cond_steps,
+        help="Pin the first k timesteps of every window for training and sampling.",
+    )
     parser.add_argument("--stride", type=int, default=Config.stride)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--base-channels", type=int, default=Config.base_channels)
@@ -300,6 +328,7 @@ def main() -> None:
         data_root=args.data_root,
         robot=args.robot,
         seq_len=args.seq_len,
+        cond_steps=args.cond_steps,
         stride=args.stride,
         batch_size=args.batch_size,
         base_channels=args.base_channels,
@@ -316,6 +345,8 @@ def main() -> None:
         num_plot_dims=args.num_plot_dims,
         download=not args.no_download,
     )
+    if not (1 <= config.cond_steps <= config.seq_len):
+        raise ValueError(f"Need 1 <= cond-steps <= seq-len; got cond_steps={config.cond_steps}, seq_len={config.seq_len}")
 
     torch.set_num_threads(max(config.num_threads, 1))
     torch.manual_seed(config.seed)
@@ -338,6 +369,7 @@ def main() -> None:
             base_channels=config.base_channels,
             cond_dim=config.cond_dim,
         ),
+        cond_steps=config.cond_steps,
     ).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=config.lr)
     out_dir = Path(__file__).resolve().parent / "outputs" / "EqM_lafan1"
