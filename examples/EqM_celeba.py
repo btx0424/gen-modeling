@@ -1,5 +1,5 @@
 """
-Equilibrium Matching on STL-10 with a conditional U-Net backbone.
+Equilibrium Matching on CelebA with an unconditional U-Net backbone.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from gen_modeling.datasets.images import ImageDatasetInfo, STL10Dataset, tensor_batch_to_display
+from gen_modeling.datasets.images import CelebADataset, ImageDatasetInfo, tensor_batch_to_display
 from gen_modeling.modules import ConditionalUNet2D
 
 
@@ -53,68 +53,58 @@ class EqM(nn.Module):
         self.sample_shape = sample_shape
         self.grad_magnitude = eqm_ct()
 
-    def compute_loss(self, x1: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def compute_loss(self, x1: torch.Tensor) -> torch.Tensor:
         expand_shape = (-1,) + (x1.ndim - 1) * (1,)
         t = torch.rand(x1.shape[0], device=x1.device, dtype=x1.dtype).reshape(expand_shape)
         x0 = torch.randn_like(x1)
         xt = t * x1 + (1.0 - t) * x0
         target = (x1 - x0) * self.grad_magnitude(t)
-        pred = self.network(xt, y)
+        pred = self.network(xt, None)
         return ((pred - target) ** 2).mean()
 
     @torch.inference_mode()
-    def sample_gd(self, labels: torch.Tensor, device: torch.device, num_steps: int, stepsize: float) -> torch.Tensor:
+    def sample_gd(self, num_samples: int, device: torch.device, num_steps: int, stepsize: float) -> torch.Tensor:
         dtype = next(self.parameters()).dtype
-        x = torch.randn((labels.shape[0],) + self.network.sample_shape, device=device, dtype=dtype)
+        x = torch.randn((num_samples,) + self.network.sample_shape, device=device, dtype=dtype)
         for _ in range(num_steps):
-            x = x + stepsize * self.network(x, labels)
+            x = x + stepsize * self.network(x, None)
         return x
 
     @torch.inference_mode()
     def sample_nag(
         self,
-        labels: torch.Tensor,
+        num_samples: int,
         device: torch.device,
         num_steps: int,
         stepsize: float,
         mu: float,
     ) -> torch.Tensor:
         dtype = next(self.parameters()).dtype
-        x = torch.randn((labels.shape[0],) + self.sample_shape, device=device, dtype=dtype)
+        x = torch.randn((num_samples,) + self.sample_shape, device=device, dtype=dtype)
         momentum = torch.zeros_like(x)
         for _ in range(num_steps):
             lookahead = x + stepsize * mu * momentum
-            momentum = self.network(lookahead, labels)
+            momentum = self.network(lookahead, None)
             x = x + stepsize * momentum
         return x
 
 
-def make_eval_labels(num_samples: int, num_classes: int, device: torch.device) -> torch.Tensor:
-    labels = torch.arange(num_classes, device=device, dtype=torch.long)
-    repeats = (num_samples + num_classes - 1) // num_classes
-    return labels.repeat(repeats)[:num_samples]
-
-
-def plot_stl10_grid(
+def plot_image_grid(
     samples: torch.Tensor,
-    labels: torch.Tensor,
     path: Path,
     *,
     num_show: int,
-    num_classes: int,
     data_info: ImageDatasetInfo,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     samples = tensor_batch_to_display(samples[:num_show], data_info)
-    labels = labels[:num_show].detach().cpu()
-    n_cols = num_classes
+    n_cols = int(np.ceil(np.sqrt(samples.shape[0])))
     n_rows = int(np.ceil(samples.shape[0] / n_cols))
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(1.6 * n_cols, 1.6 * n_rows))
     axes = np.asarray(axes).reshape(-1)
-    for idx, (ax, image) in enumerate(zip(axes, samples, strict=False)):
+    for ax, image in zip(axes, samples, strict=False):
         ax.imshow(image.permute(1, 2, 0).numpy())
         ax.axis("off")
-        ax.set_title(str(int(labels[idx].item())), fontsize=8, pad=1)
     for ax in axes[samples.shape[0]:]:
         ax.axis("off")
     plt.tight_layout(pad=0.08)
@@ -124,7 +114,6 @@ def plot_stl10_grid(
 
 def sample_and_save(
     model: EqM,
-    num_classes: int,
     config: Config,
     device: torch.device,
     out_path: Path,
@@ -133,20 +122,17 @@ def sample_and_save(
     data_info: ImageDatasetInfo,
 ) -> dict[str, float]:
     sample_fn = model.sample_nag if config.sample_sampler == "nag" else model.sample_gd
-    labels = make_eval_labels(config.num_plot_samples, num_classes, device)
     samples = sample_fn(
-        labels=labels,
+        num_samples=config.num_plot_samples,
         device=device,
         num_steps=config.sample_steps,
         stepsize=config.sample_stepsize,
         **({"mu": config.sample_mu} if config.sample_sampler == "nag" else {}),
     )
-    plot_stl10_grid(
+    plot_image_grid(
         samples,
-        labels,
         out_path,
         num_show=config.num_plot_samples,
-        num_classes=num_classes,
         data_info=data_info,
     )
     metrics = {
@@ -161,7 +147,7 @@ def sample_and_save(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="STL-10 EqM.")
+    parser = argparse.ArgumentParser(description="CelebA EqM.")
     parser.add_argument("--data-root", type=str, default=Config.data_root)
     parser.add_argument("--split", type=str, default=Config.split)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
@@ -198,41 +184,39 @@ def main() -> None:
     np.random.seed(config.seed)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    dataset = STL10Dataset(config.data_root, split=config.split, download=True, normalize=True)
+    dataset = CelebADataset(config.data_root, split=config.split, download=True, normalize=True)
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
 
     model = EqM(
         network=ConditionalUNet2D(
             in_channels=dataset.info.channels,
             out_channels=dataset.info.channels,
-            num_classes=dataset.info.num_classes,
+            num_classes=1,
             base_channels=config.base_channels,
             channel_mults=(1, 2, 4, 4),
         ),
         sample_shape=(dataset.info.channels, dataset.info.height, dataset.info.width),
     ).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=config.lr)
-    out_dir = Path(__file__).resolve().parent / "outputs" / "EqM_stl10"
+    out_dir = Path(__file__).resolve().parent / "outputs" / "EqM_celeba"
 
     for epoch in range(config.train_epochs):
         model.train()
         pbar = tqdm(loader, desc=f"epoch {epoch}")
         losses = []
-        for x, y in pbar:
+        for x, _ in pbar:
             x = x.to(device)
-            y = y.to(device)
             optimizer.zero_grad(set_to_none=True)
-            loss = model.compute_loss(x, y)
+            loss = model.compute_loss(x)
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
             pbar.set_postfix(loss=f"{loss.item():.5f}")
 
-        epoch_grid = out_dir / f"eqm_stl10_epoch_{epoch:03d}.png"
-        epoch_metrics = out_dir / f"eqm_stl10_epoch_{epoch:03d}.json"
+        epoch_grid = out_dir / f"eqm_celeba_epoch_{epoch:03d}.png"
+        epoch_metrics = out_dir / f"eqm_celeba_epoch_{epoch:03d}.json"
         metrics = sample_and_save(
             model,
-            dataset.info.num_classes,
             config,
             device,
             epoch_grid,
@@ -246,11 +230,10 @@ def main() -> None:
                 f"sample_std={metrics['sample_std']:.6f}"
             )
 
-    out = out_dir / "eqm_stl10_samples.png"
-    metrics_path = out_dir / "eqm_metrics.json"
+    out = out_dir / "eqm_celeba_samples.png"
+    metrics_path = out_dir / "eqm_celeba_metrics.json"
     metrics = sample_and_save(
         model,
-        dataset.info.num_classes,
         config,
         device,
         out,
@@ -258,7 +241,7 @@ def main() -> None:
         data_info=dataset.info,
     )
     print(json.dumps(metrics, indent=2))
-    print("Saved per-epoch STL-10 samples and final metrics under examples/outputs")
+    print("Saved per-epoch CelebA EqM samples and final metrics under examples/outputs")
     print(f"Saved plot to {out}")
 
 

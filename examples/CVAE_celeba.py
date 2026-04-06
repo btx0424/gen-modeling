@@ -1,5 +1,5 @@
 """
-Conditional VAE on STL-10 with a bottlenecked convolutional encoder/decoder.
+Unconditional VAE on CelebA with a bottlenecked convolutional encoder/decoder.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from gen_modeling.datasets.images import ImageDatasetInfo, STL10Dataset, tensor_batch_to_display
+from gen_modeling.datasets.images import CelebADataset, ImageDatasetInfo, tensor_batch_to_display
 from gen_modeling.modules.cnn import (
     Downsample2d,
     PixelShuffleUpsample2d,
@@ -85,11 +85,10 @@ class PixelShuffleUpBlock(nn.Module):
 
 class ConditionalEncoder(nn.Module):
     def __init__(
-        self, base_channels: int, latent_dim: int, num_classes: int, data_info: ImageDatasetInfo
+        self, base_channels: int, latent_dim: int, data_info: ImageDatasetInfo
     ) -> None:
         super().__init__()
-        self.num_classes = num_classes
-        in_channels = data_info.channels + num_classes
+        in_channels = data_info.channels
         self.stem = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
         self.down1 = DownBlock(base_channels, base_channels)
         self.down2 = DownBlock(base_channels, base_channels * 2)
@@ -101,10 +100,8 @@ class ConditionalEncoder(nn.Module):
         flat_dim = base_channels * 4 * h_sp * w_sp
         self.to_parames = nn.Linear(flat_dim, latent_dim * 2)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        y_onehot = F.one_hot(y, num_classes=self.num_classes).to(dtype=x.dtype)
-        y_map = y_onehot[:, :, None, None].expand(-1, -1, x.shape[-2], x.shape[-1])
-        h = self.stem(torch.cat([x, y_map], dim=1))
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        h = self.stem(x)
         h = self.down1(h)
         h = self.down2(h)
         h = self.down3(h)
@@ -116,13 +113,12 @@ class ConditionalEncoder(nn.Module):
 
 class ConditionalDecoder(nn.Module):
     def __init__(
-        self, base_channels: int, latent_dim: int, num_classes: int, data_info: ImageDatasetInfo
+        self, base_channels: int, latent_dim: int, data_info: ImageDatasetInfo
     ) -> None:
         super().__init__()
-        self.label_embedding = nn.Embedding(num_classes, latent_dim)
         h_sp = data_info.height // 8
         w_sp = data_info.width // 8
-        self.to_seed = nn.Linear(latent_dim * 2, base_channels * 4 * h_sp * w_sp)
+        self.to_seed = nn.Linear(latent_dim, base_channels * 4 * h_sp * w_sp)
         self.up1 = PixelShuffleUpBlock(base_channels * 4, base_channels * 2)
         self.up2 = PixelShuffleUpBlock(base_channels * 2, base_channels)
         self.up3 = PixelShuffleUpBlock(base_channels, base_channels)
@@ -130,9 +126,8 @@ class ConditionalDecoder(nn.Module):
         self._seed_h = h_sp
         self._seed_w = w_sp
 
-    def forward(self, z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        cond = torch.cat([z, self.label_embedding(y)], dim=-1)
-        h = self.to_seed(cond).reshape(z.shape[0], -1, self._seed_h, self._seed_w)
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        h = self.to_seed(z).reshape(z.shape[0], -1, self._seed_h, self._seed_w)
         h = self.up1(h)
         h = self.up2(h)
         h = self.up3(h)
@@ -142,32 +137,30 @@ class ConditionalDecoder(nn.Module):
 class CVAE(nn.Module):
     def __init__(self, base_channels: int, latent_dim: int, data_info: ImageDatasetInfo) -> None:
         super().__init__()
-        nc = data_info.num_classes
-        self.encoder = ConditionalEncoder(base_channels, latent_dim, nc, data_info)
-        self.decoder = ConditionalDecoder(base_channels, latent_dim, nc, data_info)
+        self.encoder = ConditionalEncoder(base_channels, latent_dim, data_info)
+        self.decoder = ConditionalDecoder(base_channels, latent_dim, data_info)
         self.latent_dim = latent_dim
-        self.num_classes = nc
         self.sample_shape = (data_info.channels, data_info.height, data_info.width)
         init_conv_modules(self)
 
-    def encode(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.encoder(x, y)
+    def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.encoder(x)
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         std = torch.exp(0.5 * logvar)
         return mu + std * torch.randn_like(std)
 
-    def decode(self, z: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return self.decoder(z, y)
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        return self.decoder(z)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        mu, logvar = self.encode(x, y)
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
-        recon = self.decode(z, y)
+        recon = self.decode(z)
         return recon, mu, logvar
 
-    def compute_loss(self, x: torch.Tensor, y: torch.Tensor, kl_beta: float) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        recon, mu, logvar = self(x, y)
+    def compute_loss(self, x: torch.Tensor, kl_beta: float) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        recon, mu, logvar = self(x)
         recon_loss = F.mse_loss(recon, x)
         kl = -0.5 * (1.0 + logvar - mu.square() - logvar.exp()).mean()
         loss = recon_loss + kl_beta * kl
@@ -178,37 +171,27 @@ class CVAE(nn.Module):
         }
 
     @torch.inference_mode()
-    def sample(self, labels: torch.Tensor, device: torch.device) -> torch.Tensor:
-        z = torch.randn(labels.shape[0], self.latent_dim, device=device)
-        return self.decode(z, labels)
+    def sample(self, num_samples: int, device: torch.device) -> torch.Tensor:
+        z = torch.randn(num_samples, self.latent_dim, device=device)
+        return self.decode(z)
 
 
-def make_eval_labels(num_samples: int, num_classes: int, device: torch.device) -> torch.Tensor:
-    labels = torch.arange(num_classes, device=device, dtype=torch.long)
-    repeats = (num_samples + num_classes - 1) // num_classes
-    return labels.repeat(repeats)[:num_samples]
-
-
-def plot_stl10_grid(
+def plot_image_grid(
     samples: torch.Tensor,
-    labels: torch.Tensor,
     path: Path,
     *,
     num_show: int,
-    num_classes: int,
     data_info: ImageDatasetInfo,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     samples = tensor_batch_to_display(samples[:num_show], data_info)
-    labels = labels[:num_show].detach().cpu()
-    n_cols = num_classes
+    n_cols = int(np.ceil(np.sqrt(samples.shape[0])))
     n_rows = int(np.ceil(samples.shape[0] / n_cols))
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(1.6 * n_cols, 1.6 * n_rows))
     axes = np.asarray(axes).reshape(-1)
-    for idx, (ax, image) in enumerate(zip(axes, samples, strict=False)):
+    for ax, image in zip(axes, samples, strict=False):
         ax.imshow(image.permute(1, 2, 0).numpy())
         ax.axis("off")
-        ax.set_title(str(int(labels[idx].item())), fontsize=8, pad=1)
     for ax in axes[samples.shape[0]:]:
         ax.axis("off")
     plt.tight_layout(pad=0.08)
@@ -216,30 +199,26 @@ def plot_stl10_grid(
     plt.close(fig)
 
 
-def plot_stl10_recon_grid(
+def plot_recon_grid(
     inputs: torch.Tensor,
     recons: torch.Tensor,
-    labels: torch.Tensor,
     path: Path,
     *,
     num_show: int,
-    num_classes: int,
     data_info: ImageDatasetInfo,
 ) -> None:
-    """Each cell: [original | reconstruction] side by side; title is the class label."""
+    """Each cell: [original | reconstruction] side by side."""
     path.parent.mkdir(parents=True, exist_ok=True)
     inputs_vis = tensor_batch_to_display(inputs[:num_show], data_info)
     recons_vis = tensor_batch_to_display(recons[:num_show], data_info)
-    labels = labels[:num_show].detach().cpu()
     pairs = torch.cat([inputs_vis, recons_vis], dim=-1)
-    n_cols = num_classes
+    n_cols = int(np.ceil(np.sqrt(num_show)))
     n_rows = int(np.ceil(num_show / n_cols))
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.0 * n_cols, 1.6 * n_rows))
     axes = np.asarray(axes).reshape(-1)
-    for idx, (ax, image) in enumerate(zip(axes, pairs, strict=False)):
+    for ax, image in zip(axes, pairs, strict=False):
         ax.imshow(image.permute(1, 2, 0).numpy())
         ax.axis("off")
-        ax.set_title(str(int(labels[idx].item())), fontsize=8, pad=1)
     for ax in axes[num_show:]:
         ax.axis("off")
     plt.tight_layout(pad=0.08)
@@ -256,35 +235,26 @@ def sample_and_save(
     *,
     recon_path: Path | None = None,
     eval_x: torch.Tensor | None = None,
-    eval_y: torch.Tensor | None = None,
-    *,
     data_info: ImageDatasetInfo,
 ) -> dict[str, float]:
-    nc = data_info.num_classes
-    labels = make_eval_labels(config.num_plot_samples, nc, device)
-    samples = model.sample(labels, device)
-    plot_stl10_grid(
-        samples, labels, out_path, num_show=config.num_plot_samples, num_classes=nc, data_info=data_info
-    )
+    samples = model.sample(config.num_plot_samples, device)
+    plot_image_grid(samples, out_path, num_show=config.num_plot_samples, data_info=data_info)
     metrics: dict[str, float] = {
         "sample_mean": samples.mean().item(),
         "sample_std": samples.std().item(),
         "sample_min": samples.min().item(),
         "sample_max": samples.max().item(),
     }
-    if recon_path is not None and eval_x is not None and eval_y is not None:
+    if recon_path is not None and eval_x is not None:
         x_e = eval_x.to(device)
-        y_e = eval_y.to(device)
-        mu, _ = model.encode(x_e, y_e)
-        recons = model.decode(mu, y_e)
+        mu, _ = model.encode(x_e)
+        recons = model.decode(mu)
         n = min(config.num_plot_samples, x_e.shape[0])
-        plot_stl10_recon_grid(
+        plot_recon_grid(
             x_e,
             recons,
-            y_e,
             recon_path,
             num_show=n,
-            num_classes=nc,
             data_info=data_info,
         )
         metrics["recon_mse_eval"] = F.mse_loss(recons, x_e).item()
@@ -294,7 +264,7 @@ def sample_and_save(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="STL-10 CVAE.")
+    parser = argparse.ArgumentParser(description="CelebA CVAE.")
     parser.add_argument("--data-root", type=str, default=Config.data_root)
     parser.add_argument("--split", type=str, default=Config.split)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
@@ -341,7 +311,7 @@ def main() -> None:
     np.random.seed(config.seed)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    dataset = STL10Dataset(config.data_root, split=config.split, download=True, normalize=True)
+    dataset = CelebADataset(config.data_root, split=config.split, download=False, normalize=True)
     pin = device.type == "cuda"
     loader = DataLoader(
         dataset,
@@ -351,23 +321,22 @@ def main() -> None:
     )
     # Fixed batch for reconstruction vis (same images every epoch); workers not worth it.
     vis_loader = DataLoader(dataset, batch_size=config.num_plot_samples, shuffle=False)
-    eval_x, eval_y = next(iter(vis_loader))
+    eval_x, _ = next(iter(vis_loader))
 
     model = CVAE(config.base_channels, config.latent_dim, dataset.info).to(device)
     if not args.no_compile:
         model = torch.compile(model)
     optimizer = optim.Adam(model.parameters(), lr=config.lr)
-    out_dir = Path(__file__).resolve().parent / "outputs" / "CVAE_stl10"
+    out_dir = Path(__file__).resolve().parent / "outputs" / "CVAE_celeba"
 
     for epoch in range(config.train_epochs):
         model.train()
         pbar = tqdm(loader, desc=f"epoch {epoch}")
         last_metrics: dict[str, torch.Tensor] | None = None
-        for x, y in pbar:
+        for x, _ in pbar:
             x = x.to(device)
-            y = y.to(device)
             optimizer.zero_grad(set_to_none=True)
-            loss, metrics = model.compute_loss(x, y, config.kl_beta)
+            loss, metrics = model.compute_loss(x, config.kl_beta)
             loss.backward()
             optimizer.step()
             last_metrics = metrics
@@ -377,9 +346,9 @@ def main() -> None:
                 kl=f"{metrics['kl'].item():.5f}",
             )
 
-        epoch_grid = out_dir / f"cvae_stl10_epoch_{epoch:03d}.png"
-        epoch_recon = out_dir / f"cvae_stl10_epoch_{epoch:03d}_recon.png"
-        epoch_metrics = out_dir / f"cvae_stl10_epoch_{epoch:03d}.json"
+        epoch_grid = out_dir / f"cvae_celeba_epoch_{epoch:03d}.png"
+        epoch_recon = out_dir / f"cvae_celeba_epoch_{epoch:03d}_recon.png"
+        epoch_metrics = out_dir / f"cvae_celeba_epoch_{epoch:03d}.json"
         model.eval()
         metrics = sample_and_save(
             model,
@@ -389,7 +358,6 @@ def main() -> None:
             epoch_metrics,
             recon_path=epoch_recon,
             eval_x=eval_x,
-            eval_y=eval_y,
             data_info=dataset.info,
         )
         if last_metrics is not None:
@@ -407,8 +375,8 @@ def main() -> None:
                 f"{extra}"
             )
 
-    out = out_dir / "cvae_stl10_samples.png"
-    out_recon = out_dir / "cvae_stl10_recon.png"
+    out = out_dir / "cvae_celeba_samples.png"
+    out_recon = out_dir / "cvae_celeba_recon.png"
     metrics_path = out_dir / "cvae_metrics.json"
     model.eval()
     metrics = sample_and_save(
@@ -419,11 +387,10 @@ def main() -> None:
         metrics_path,
         recon_path=out_recon,
         eval_x=eval_x,
-        eval_y=eval_y,
         data_info=dataset.info,
     )
     print(json.dumps(metrics, indent=2))
-    print("Saved per-epoch STL-10 samples, recon grids, and final metrics under examples/outputs")
+    print("Saved per-epoch CelebA samples, recon grids, and final metrics under examples/outputs")
     print(f"Saved plots to {out} and {out_recon}")
 
 
