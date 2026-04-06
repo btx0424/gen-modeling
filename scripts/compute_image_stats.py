@@ -3,11 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from tqdm import tqdm
 
 import torch
 from torch.utils.data import DataLoader
 
-from gen_modeling.datasets.images import MNISTDataset, STL10Dataset
+from gen_modeling.datasets.images import CelebADataset, MNISTDataset, STL10Dataset
 
 
 def build_dataset(name: str, data_root: Path, split: str):
@@ -16,6 +17,8 @@ def build_dataset(name: str, data_root: Path, split: str):
         return MNISTDataset(data_root, train=train, download=True, normalize=False)
     if name == "stl10":
         return STL10Dataset(data_root, split=split, download=True, normalize=False)
+    if name == "celeba":
+        return CelebADataset(data_root, split=split, download=True, normalize=False)
     raise ValueError(f"Unknown dataset: {name}")
 
 
@@ -25,7 +28,7 @@ def compute_stats(loader: DataLoader, num_channels: int) -> tuple[torch.Tensor, 
     pixel_sq_sum = torch.zeros(num_channels, dtype=torch.float64)
     total_pixels = 0
 
-    for images, _ in loader:
+    for images, _ in tqdm(loader, desc="Computing stats"):
         images = images.to(dtype=torch.float64)
         batch_size, channels, height, width = images.shape
         if channels != num_channels:
@@ -43,7 +46,7 @@ def compute_stats(loader: DataLoader, num_channels: int) -> tuple[torch.Tensor, 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compute per-channel mean/std for image datasets.")
-    parser.add_argument("--dataset", choices=["mnist", "stl10"], required=True)
+    parser.add_argument("--dataset", choices=["mnist", "stl10", "celeba"], required=True)
     parser.add_argument("--data-root", type=Path, default=Path("./data"))
     parser.add_argument("--split", type=str, default="train")
     parser.add_argument("--batch-size", type=int, default=128)
@@ -62,6 +65,9 @@ def main() -> None:
     payload = {
         "dataset": args.dataset,
         "split": args.split,
+        "height": dataset.info.height,
+        "width": dataset.info.width,
+        "channels": dataset.info.channels,
         "mean": [float(v) for v in mean.tolist()],
         "std": [float(v) for v in std.tolist()],
     }

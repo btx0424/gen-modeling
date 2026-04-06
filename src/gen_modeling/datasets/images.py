@@ -6,8 +6,8 @@ from typing import Tuple
 
 import torch
 from torch.utils.data import Dataset
-from torchvision.datasets import MNIST, STL10
-from torchvision.transforms import Compose, Normalize, Resize, ToTensor
+from torchvision.datasets import CelebA, MNIST, STL10
+from torchvision.transforms import CenterCrop, Compose, Normalize, Resize, ToTensor
 
 
 @dataclass(frozen=True)
@@ -127,3 +127,61 @@ class STL10Dataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         image, label = self.dataset[index]
         return image, torch.tensor(label, dtype=torch.long)
+
+
+class CelebADataset(Dataset):
+    """
+    CelebA (aligned & cropped faces) with optional square crop, resize, and normalization.
+
+    Targets are the 40 binary attribute labels (same as torchvision ``target_type="attr"``).
+    """
+
+    mean: Tuple[float, float, float] = (0.508415937423706, 0.42235133051872253, 0.37673765420913696)
+    std: Tuple[float, float, float] = (0.3012216091156006, 0.2787898778915405, 0.27734696865081787)
+
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        split: str = "train",
+        download: bool = False,
+        normalize: bool = True,
+        size: int | None = 64,
+        center_crop: int | None = 178,
+    ) -> None:
+        super().__init__()
+        transforms_list: list = []
+        if center_crop is not None:
+            transforms_list.append(CenterCrop(center_crop))
+        if size is not None:
+            h, w = size, size
+            transforms_list.append(Resize((h, w)))
+        else:
+            h, w = (center_crop, center_crop) if center_crop is not None else (218, 178)
+
+        self.info = ImageDatasetInfo(
+            channels=3,
+            height=h,
+            width=w,
+            num_classes=40,
+            norm_mean=self.mean if normalize else None,
+            norm_std=self.std if normalize else None,
+        )
+        transforms_list.append(ToTensor())
+        if normalize:
+            transforms_list.append(Normalize(self.mean, self.std))
+
+        self.dataset = CelebA(
+            root=str(root),
+            split=split,
+            target_type="attr",
+            download=download,
+            transform=Compose(transforms_list),
+        )
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        image, attr = self.dataset[index]
+        return image, attr.long()

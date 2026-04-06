@@ -1,4 +1,4 @@
-from .images import ImageDatasetInfo, MNISTDataset, STL10Dataset, tensor_batch_to_display
+from .images import CelebADataset, ImageDatasetInfo, MNISTDataset, STL10Dataset, tensor_batch_to_display
 from .synthetic import (
     CheckerboardDataset,
     GaussianMixtureDataset,
@@ -8,6 +8,7 @@ from .synthetic import (
 )
 
 __all__ = [
+    "CelebADataset",
     "CheckerboardDataset",
     "GaussianMixtureDataset",
     "ImageDatasetInfo",
