@@ -195,7 +195,7 @@ def save_validation_rollouts_csv(
     epoch: int,
 ) -> dict[str, float | int | str]:
     """
-    Sliding-window rollouts in normalized space, denormalize, then write one CSV per sample
+    Sliding-window rollouts in physical trajectory space, then write one CSV per sample
     in retargeting **qpos** layout (``xyzw`` quaternion + ``jpos``; no ``jvel``).
     """
     model.eval()
@@ -206,13 +206,14 @@ def save_validation_rollouts_csv(
     total_len = config.val_total_len
     traj = sliding_window_generate(
         model,
+        dataset,
         config,
         device,
         cond_prefix,
         total_len,
         stride,
     )
-    traj_denorm = dataset.denormalize(traj.detach().cpu())
+    traj_denorm = traj.detach().cpu()
 
     val_dir = out_dir / "validation" / f"epoch_{epoch:03d}"
     val_dir.mkdir(parents=True, exist_ok=True)
@@ -240,6 +241,7 @@ def save_validation_rollouts_csv(
 @torch.no_grad()
 def sliding_window_generate(
     model: EqM,
+    dataset: LAFAN1Dataset,
     config: Config,
     device: torch.device,
     cond_prefix: Float[Tensor, "batch cond dim"],
@@ -250,10 +252,9 @@ def sliding_window_generate(
     Generate a trajectory longer than ``seq_len`` by repeatedly sampling a length-``seq_len``
     window and advancing the window start by ``window_stride`` frames.
 
-    The stitched ``traj`` is stored in the **rollout root frame** (relative to timestep 0).
-    The model sees each window after :meth:`LAFAN1Dataset.make_relative` (relative to
-    ``ws``). New chunks are merged with :meth:`LAFAN1Dataset.accumulate_chunk_in_root_frame`
-    so root position and rot6d compose correctly; jpos/jvel pass through.
+    The stitched ``traj`` is stored in physical trajectory space (unnormalized). Normalization
+    is applied only at the model boundary: right before calling ``sample_*`` with
+    ``cond_prefix``, and right after sampling to map generated chunks back to physical space.
 
     Require ``window_stride <= seq_len - cond_steps`` so the next prefix always lies in
     frames already filled by the previous chunk (standard non-gap overlap condition).
@@ -261,8 +262,7 @@ def sliding_window_generate(
     Parameters
     ----------
     cond_prefix
-        Shape ``(N, cond_steps, D)`` in the same normalized space as training (e.g. after
-        ``make_relative`` and ``normalize``).
+        Shape ``(N, cond_steps, D)`` in physical trajectory space (unnormalized).
     total_len
         Target number of timesteps ``T`` (must be at least ``cond_steps``).
     window_stride
@@ -299,17 +299,16 @@ def sliding_window_generate(
     dtype = next(model.parameters()).dtype
     n, _, dim = cond_prefix.shape
     traj = torch.zeros(n, total_len, dim, device=device, dtype=dtype)
-    cond0 = cond_prefix.to(device=device, dtype=dtype)
+    cond0 = dataset.make_relative(cond_prefix.to(device=device, dtype=dtype))
     traj[:, :k] = cond0
 
     ws = 0
     while True:
         if ws + k > total_len:
             break
-        # Stitched buffer is in the rollout root frame (relative to t=0). The model was
-        # trained on windows after make_relative, i.e. relative to each window's first frame.
+        # traj and cond0 stay in physical space; only model inputs/outputs are normalized.
         traj_ws = traj[:, ws : ws + k]
-        cond_local = LAFAN1Dataset.make_relative(traj_ws)
+        cond_local = dataset.normalize(dataset.make_relative(traj_ws))
         root_pos_ref = traj[:, ws, :3]
         root_rot6d_ref = traj[:, ws, 3:POSE_BASE_DIM]
 
@@ -322,20 +321,18 @@ def sliding_window_generate(
             **kwargs,
         )
         n_write = min(seq_len, total_len - ws)
-        chunk_merged = LAFAN1Dataset.accumulate_chunk_in_root_frame(
-            chunk[:, :n_write],
+        chunk_phys = dataset.denormalize(chunk[:, :n_write])
+        chunk_merged_phys = dataset.accumulate_chunk_in_root_frame(
+            chunk_phys,
             root_pos_ref,
             root_rot6d_ref,
         )
-        traj[:, ws : ws + n_write] = chunk_merged
+        traj[:, ws : ws + n_write] = chunk_merged_phys
         if ws + n_write >= total_len:
             break
         ws += window_stride
         if ws >= total_len:
             break
-    
-    # TODO: convert from rot6d to quat_xyzw
-
     return traj
 
 
@@ -346,7 +343,6 @@ def _save_checkpoint(
     model: nn.Module,
     optimizer: optim.Optimizer,
     config: Config,
-    reference_batch: torch.Tensor | None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -354,7 +350,6 @@ def _save_checkpoint(
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "config": dataclasses.asdict(config),
-        "reference_batch": reference_batch,
         "torch_rng_state": torch.get_rng_state(),
         "numpy_rng_state": np.random.get_state(),
     }
@@ -365,7 +360,7 @@ def _load_checkpoint(
     path: Path,
     model: nn.Module,
     optimizer: optim.Optimizer,
-) -> tuple[int, torch.Tensor | None]:
+) -> int:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(payload["model_state_dict"])
     optimizer.load_state_dict(payload["optimizer_state_dict"])
@@ -373,23 +368,7 @@ def _load_checkpoint(
         torch.set_rng_state(payload["torch_rng_state"].contiguous().cpu())
     if "numpy_rng_state" in payload:
         np.random.set_state(payload["numpy_rng_state"])
-    epoch = int(payload["epoch"])
-    ref = payload.get("reference_batch")
-    if ref is not None:
-        ref = ref.detach().cpu()
-    return epoch, ref
-
-
-@torch.no_grad()
-def _first_normalized_batch(
-    loader: DataLoader,
-    dataset: LAFAN1Dataset,
-    device: torch.device,
-) -> Float[Tensor, "batch seq dim"]:
-    x, _ = next(iter(loader))
-    x = dataset.make_relative(x.to(device))
-    x = dataset.normalize(x)
-    return x.detach().cpu()
+    return int(payload["epoch"])
 
 
 def main() -> None:
@@ -439,7 +418,7 @@ def main() -> None:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Load weights, optimizer, RNG, and reference batch from --checkpoint and continue.",
+        help="Load weights, optimizer, and RNG from --checkpoint and continue.",
     )
     args = parser.parse_args()
 
@@ -506,7 +485,7 @@ def main() -> None:
     if args.resume:
         if not checkpoint_path.is_file():
             raise FileNotFoundError(f"--resume requested but no checkpoint at {checkpoint_path}")
-        start_epoch, reference_batch = _load_checkpoint(checkpoint_path, model, optimizer)
+        start_epoch = _load_checkpoint(checkpoint_path, model, optimizer)
         start_epoch += 1
         print(f"Resumed from {checkpoint_path}; training from epoch {start_epoch}")
 
@@ -514,20 +493,19 @@ def main() -> None:
         model.train()
         pbar = tqdm(loader, desc=f"epoch {epoch}")
         losses: list[float] = []
-        for x, _meta in pbar:
-            x = dataset.make_relative(x.to(device))
-            x = dataset.normalize(x)
+        reference_batch = None
+
+        for batch, _meta in pbar:
             if reference_batch is None:
-                reference_batch = x.detach().cpu()
+                reference_batch = batch.cpu()
+            batch_norm = dataset.normalize(dataset.make_relative(batch.to(device)))
             optimizer.zero_grad(set_to_none=True)
-            loss = model.compute_loss(x)
+            loss = model.compute_loss(batch_norm)
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
             pbar.set_postfix(loss=f"{loss.item():.5f}")
 
-        if reference_batch is None:
-            reference_batch = _first_normalized_batch(loader, dataset, device)
         metrics = save_validation_rollouts_csv(
             model,
             config,
@@ -543,7 +521,6 @@ def main() -> None:
             model=model,
             optimizer=optimizer,
             config=config,
-            reference_batch=reference_batch,
         )
         if losses:
             print(
@@ -552,11 +529,7 @@ def main() -> None:
                 f"sample_std={metrics['sample_std']:.6f}"
             )
 
-    ref_final = (
-        reference_batch
-        if reference_batch is not None
-        else _first_normalized_batch(loader, dataset, device)
-    )
+    ref_final = reference_batch
     final_meta = save_validation_rollouts_csv(
         model,
         config,

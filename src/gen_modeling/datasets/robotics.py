@@ -20,6 +20,7 @@ from torch.utils.data import Dataset
 from gen_modeling.utils.math import (
     quat_conjugate,
     quat_mul,
+    quat_rotate,
     quat_to_rot6d,
     quat_wxyz_to_xyzw,
     rot6d_from_matrix,
@@ -84,9 +85,12 @@ class LAFAN1Dataset(Dataset):
     Can be downloaded from https://huggingface.co/datasets/lvhaidong/LAFAN1_Retargeting_Dataset
 
     All clips are loaded into memory at construction (``float32``) to avoid disk I/O
-    during training. Per-joint mean and population standard deviation are then computed
-    over all frames in those clips for jpos and jvel; :meth:`normalize` / :meth:`denormalize`
-    apply them while leaving root position and root rot6d unchanged (rot6d is not z-scored).
+    during training. Per-joint mean and population standard deviation are computed over
+    all frames for jpos and jvel. Root position mean/std are computed over **relative**
+    root translations from every training window (same ``seq_len`` / ``stride`` as
+    :meth:`__getitem__`, via :meth:`make_relative`), matching the tensor layout seen after
+    ``make_relative`` then ``normalize`` in typical training code. Root orientation (rot6d
+    or quaternion) is not z-scored.
     Note that the original data's quaternions are in xyzw order. We convert them to wxyz order
     to align with MuJoCo's convention.
 
@@ -194,6 +198,17 @@ class LAFAN1Dataset(Dataset):
         self._jvel_mean = jvel_block.mean(dim=0)
         self._jvel_std = jvel_block.std(dim=0, correction=0).clamp_min(eps)
 
+        rel_root_rows: list[torch.Tensor] = []
+        for clip in self._clips:
+            t_rows = clip.shape[0]
+            for start in range(0, t_rows - seq_len + 1, stride):
+                chunk = clip[start : start + seq_len]
+                rel = self.make_relative(chunk)
+                rel_root_rows.append(rel[:, :3].reshape(-1, 3))
+        all_rel_root = torch.cat(rel_root_rows, dim=0)
+        self._root_pos_mean = all_rel_root.mean(dim=0)
+        self._root_pos_std = all_rel_root.std(dim=0, correction=0).clamp_min(eps)
+
         self._window_offsets: list[int] = [0]
         for w in windows_per_clip:
             self._window_offsets.append(self._window_offsets[-1] + w)
@@ -250,17 +265,18 @@ class LAFAN1Dataset(Dataset):
             root_rot6d = trajectory[..., 3:9]
             R = rot6d_to_matrix(root_rot6d)
             R0 = R[..., 0:1, :, :]
-            R_rel = torch.matmul(R0.transpose(-1, -2), R)
+            R0_inv = R0.transpose(-1, -2)
+            R_rel = torch.matmul(R0_inv, R)
             root_rot6d_rel = rot6d_from_matrix(R_rel)
+            root_pos_rel = torch.matmul(R0_inv, root_pos_rel.unsqueeze(-1)).squeeze(-1)
             result = torch.cat([root_pos_rel, root_rot6d_rel, jstates], dim=-1)
         else:
             jstates = trajectory[..., 7:]
             root_wxyz = trajectory[..., 3:7]
             root_wxyz_0 = root_wxyz[..., 0:1, :]
-            root_wxyz_rel = quat_mul(
-                quat_conjugate(root_wxyz_0).expand_as(root_wxyz),
-                root_wxyz
-            )
+            root_wxyz_0_inv = quat_conjugate(root_wxyz_0).expand_as(root_wxyz)
+            root_wxyz_rel = quat_mul(root_wxyz_0_inv, root_wxyz)
+            root_pos_rel = quat_rotate(root_wxyz_0_inv, root_pos_rel)
             result = torch.cat([root_pos_rel, root_wxyz_rel, jstates], dim=-1)
         return result
 
@@ -289,7 +305,10 @@ class LAFAN1Dataset(Dataset):
         tail = chunk_local[..., POSE_BASE_DIM:]
         R_ref = rot6d_to_matrix(root_rot6d_ref)
         R_l = rot6d_to_matrix(rot6d_l)
-        pos_g = pos_l + root_pos_ref.unsqueeze(-2)
+        pos_g = (
+            torch.matmul(R_ref.unsqueeze(-3), pos_l.unsqueeze(-1)).squeeze(-1)
+            + root_pos_ref.unsqueeze(-2)
+        )
         R_g = torch.matmul(R_ref.unsqueeze(-3), R_l)
         rot6d_g = rot6d_from_matrix(R_g)
         return torch.cat([pos_g, rot6d_g, tail], dim=-1)
@@ -321,11 +340,14 @@ class LAFAN1Dataset(Dataset):
         return torch.cat([pos, quat_xyzw, jpos], dim=-1)
 
     def normalize(self, trajectory: torch.Tensor) -> torch.Tensor:
-        """Scale jpos and jvel to roughly zero mean / unit variance; root pos and rot6d unchanged."""
+        """Z-score root position (relative space), jpos, and jvel; root orientation unchanged."""
         lo = POSE_BASE_DIM
         mid = lo + self.n_joints
         out = trajectory.clone()
         device, dtype = trajectory.device, trajectory.dtype
+        rp_mean = self._root_pos_mean.to(device=device, dtype=dtype)
+        rp_std = self._root_pos_std.to(device=device, dtype=dtype)
+        out[..., :3] = (out[..., :3] - rp_mean) / rp_std.clamp_min(1e-6)
         jpos_mean, jpos_std = self._jpos_mean.to(device=device, dtype=dtype), self._jpos_std.to(device=device, dtype=dtype)
         out[..., lo:mid] = (out[..., lo:mid] - jpos_mean) / jpos_std.clamp_min(1e-6)
         jvel_mean, jvel_std = self._jvel_mean.to(device=device, dtype=dtype), self._jvel_std.to(device=device, dtype=dtype)
@@ -333,11 +355,14 @@ class LAFAN1Dataset(Dataset):
         return out
 
     def denormalize(self, trajectory: torch.Tensor) -> torch.Tensor:
-        """Inverse of :meth:`normalize` for jpos and jvel blocks."""
+        """Inverse of :meth:`normalize` for root position, jpos, and jvel."""
         lo = POSE_BASE_DIM
         mid = lo + self.n_joints
         out = trajectory.clone()
         device, dtype = trajectory.device, trajectory.dtype
+        rp_mean = self._root_pos_mean.to(device=device, dtype=dtype)
+        rp_std = self._root_pos_std.to(device=device, dtype=dtype)
+        out[..., :3] = out[..., :3] * rp_std + rp_mean
         jpos_mean, jpos_std = self._jpos_mean.to(device=device, dtype=dtype), self._jpos_std.to(device=device, dtype=dtype)
         jvel_mean, jvel_std = self._jvel_mean.to(device=device, dtype=dtype), self._jvel_std.to(device=device, dtype=dtype)
         out[..., lo:mid] = out[..., lo:mid] * jpos_std + jpos_mean
