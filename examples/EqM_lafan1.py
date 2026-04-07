@@ -5,6 +5,7 @@ This is a scaffold example using the shared 1D conditional U-Net over sequences.
 Inputs and outputs have shape (B, T, C), matching ``LAFAN1Dataset`` windows.
 Conditioning is done by pinning the first ``k`` timesteps (``--cond-steps``); the model
 is trained to match the flow field on later steps while keeping the prefix fixed.
+Each epoch, sliding-window rollouts are denormalized and saved as CSV under ``outputs/.../validation/``.
 """
 
 from __future__ import annotations
@@ -15,17 +16,17 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-from jaxtyping import Float
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from jaxtyping import Float
+from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from gen_modeling.datasets.robotics import LAFAN1Dataset, RobotName
+from gen_modeling.datasets.robotics import LAFAN1Dataset, POSE_BASE_DIM, RobotName
 from gen_modeling.modules import ConditionalUNet1D
 
 
@@ -49,11 +50,13 @@ class Config:
     sample_mu: float = 0.3
     num_plot_samples: int = 16
     num_plot_dims: int = 6
+    val_total_len: int = 128
+    val_window_stride: int | None = None
     download: bool = True
 
 
 def eqm_ct(a: float = 0.8, grad_scale: float = 4.0):
-    def func(t: torch.Tensor) -> torch.Tensor:
+    def func(t: Float[Tensor, "*batch"]) -> Float[Tensor, "*batch"]:
         return grad_scale * torch.where(t < a, 1.0, (1.0 - t) / (1.0 - a))
 
     return func
@@ -72,7 +75,7 @@ class TrajectoryEqMBackbone(nn.Module):
             cond_dim=cond_dim,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Float[Tensor, "batch time dim"]) -> Float[Tensor, "batch time dim"]:
         cond = torch.zeros(x.shape[0], self.cond_dim, device=x.device, dtype=x.dtype)
         return self.unet(x, cond, t=None)
 
@@ -86,7 +89,7 @@ class EqM(nn.Module):
         self.cond_steps = cond_steps
         self.grad_magnitude = eqm_ct()
 
-    def compute_loss(self, x1: Float[torch.Tensor, "N seq_len D"]) -> torch.Tensor:
+    def compute_loss(self, x1: Float[Tensor, "batch seq dim"]) -> Float[Tensor, ""]:
         k = self.cond_steps
         if x1.shape[1] < k:
             raise ValueError(
@@ -107,13 +110,13 @@ class EqM(nn.Module):
     @torch.inference_mode()
     def sample_gd(
         self,
-        cond_prefix: torch.Tensor,
+        cond_prefix: Float[Tensor, "batch cond dim"],
         seq_len: int,
         device: torch.device,
         *,
         num_steps: int,
         stepsize: float,
-    ) -> torch.Tensor:
+    ) -> Float[Tensor, "batch seq dim"]:
         k = self.cond_steps
         dtype = next(self.parameters()).dtype
         if cond_prefix.ndim != 3 or cond_prefix.shape[1] != k:
@@ -121,8 +124,9 @@ class EqM(nn.Module):
                 f"cond_prefix must have shape (N, {k}, D), got {tuple(cond_prefix.shape)}"
             )
         num_samples = cond_prefix.shape[0]
+        feat_dim = cond_prefix.shape[-1]
         cond_prefix = cond_prefix.to(device=device, dtype=dtype)
-        x = torch.randn(num_samples, seq_len, self.network.input_dim, device=device, dtype=dtype)
+        x = torch.randn(num_samples, seq_len, feat_dim, device=device, dtype=dtype)
         x[:, :k] = cond_prefix
         for _ in range(num_steps):
             update = self.network(x)
@@ -134,14 +138,14 @@ class EqM(nn.Module):
     @torch.inference_mode()
     def sample_nag(
         self,
-        cond_prefix: torch.Tensor,
+        cond_prefix: Float[Tensor, "batch cond dim"],
         seq_len: int,
         device: torch.device,
         *,
         num_steps: int,
         stepsize: float,
         mu: float,
-    ) -> torch.Tensor:
+    ) -> Float[Tensor, "batch seq dim"]:
         k = self.cond_steps
         dtype = next(self.parameters()).dtype
         if cond_prefix.ndim != 3 or cond_prefix.shape[1] != k:
@@ -149,8 +153,9 @@ class EqM(nn.Module):
                 f"cond_prefix must have shape (N, {k}, D), got {tuple(cond_prefix.shape)}"
             )
         num_samples = cond_prefix.shape[0]
+        feat_dim = cond_prefix.shape[-1]
         cond_prefix = cond_prefix.to(device=device, dtype=dtype)
-        x = torch.randn(num_samples, seq_len, self.network.input_dim, device=device, dtype=dtype)
+        x = torch.randn(num_samples, seq_len, feat_dim, device=device, dtype=dtype)
         x[:, :k] = cond_prefix
         momentum = torch.zeros_like(x)
         for _ in range(num_steps):
@@ -163,73 +168,175 @@ class EqM(nn.Module):
         return x
 
 
-def plot_trajectory_grid(
-    data_seq: torch.Tensor,
-    sample_seq: torch.Tensor,
-    path: Path,
-    *,
-    num_dims: int,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data_seq = data_seq.detach().cpu()
-    sample_seq = sample_seq.detach().cpu()
-    num_dims = min(num_dims, data_seq.shape[-1], sample_seq.shape[-1])
-    fig, axes = plt.subplots(num_dims, 2, figsize=(10, 1.8 * num_dims), sharex=True)
-    axes = np.atleast_2d(axes)
-    time = np.arange(data_seq.shape[0])
-    for dim in range(num_dims):
-        ax_l = axes[dim, 0]
-        ax_r = axes[dim, 1]
-        ax_l.plot(time, data_seq[:, dim].numpy(), lw=1.2)
-        ax_r.plot(time, sample_seq[:, dim].numpy(), lw=1.2, color="C1")
-        ax_l.set_ylabel(f"q[{dim}]")
-        if dim == 0:
-            ax_l.set_title("Dataset window")
-            ax_r.set_title("EqM sample")
-    axes[-1, 0].set_xlabel("timestep")
-    axes[-1, 1].set_xlabel("timestep")
-    plt.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+def _resolve_val_window_stride(config: Config) -> int:
+    k = config.cond_steps
+    max_stride = config.seq_len - k
+    if max_stride < 1:
+        raise ValueError(
+            f"Need seq_len ({config.seq_len}) > cond_steps ({k}) for sliding-window validation."
+        )
+    if config.val_window_stride is None:
+        return max_stride
+    if config.val_window_stride < 1 or config.val_window_stride > max_stride:
+        raise ValueError(
+            f"val_window_stride must be in [1, {max_stride}], got {config.val_window_stride}"
+        )
+    return config.val_window_stride
 
 
-def sample_and_save(
+@torch.no_grad()
+def save_validation_rollouts_csv(
     model: EqM,
     config: Config,
     device: torch.device,
-    reference_batch: torch.Tensor,
+    reference_batch: Float[Tensor, "batch seq dim"],
     dataset: LAFAN1Dataset,
-    out_path: Path,
-    metrics_path: Path | None = None,
-) -> dict[str, float]:
-    sample_fn = model.sample_nag if config.sample_sampler == "nag" else model.sample_gd
+    out_dir: Path,
+    epoch: int,
+) -> dict[str, float | int | str]:
+    """
+    Sliding-window rollouts in normalized space, denormalize, then write one CSV per sample
+    in retargeting **qpos** layout (``xyzw`` quaternion + ``jpos``; no ``jvel``).
+    """
+    model.eval()
     k = config.cond_steps
-    cond_prefix = reference_batch[: config.num_plot_samples, :k].to(device)
-    samples = sample_fn(
-        cond_prefix=cond_prefix,
-        seq_len=config.seq_len,
-        device=device,
-        num_steps=config.sample_steps,
-        stepsize=config.sample_stepsize,
-        **({"mu": config.sample_mu} if config.sample_sampler == "nag" else {}),
+    n = min(config.num_plot_samples, reference_batch.shape[0])
+    cond_prefix = reference_batch[:n, :k].to(device)
+    stride = _resolve_val_window_stride(config)
+    total_len = config.val_total_len
+    traj = sliding_window_generate(
+        model,
+        config,
+        device,
+        cond_prefix,
+        total_len,
+        stride,
     )
-    samples_denorm = dataset.denormalize(samples.detach().cpu())
-    ref_row_denorm = dataset.denormalize(reference_batch[0].detach().cpu())
-    plot_trajectory_grid(
-        ref_row_denorm,
-        samples_denorm[0],
-        out_path,
-        num_dims=config.num_plot_dims,
-    )
-    metrics = {
-        "sample_mean": samples_denorm.mean().item(),
-        "sample_std": samples_denorm.std().item(),
-        "sample_min": samples_denorm.min().item(),
-        "sample_max": samples_denorm.max().item(),
+    traj_denorm = dataset.denormalize(traj.detach().cpu())
+
+    val_dir = out_dir / "validation" / f"epoch_{epoch:03d}"
+    val_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        csv_qpos = dataset.trajectory_to_lafan1_csv_qpos(traj_denorm[i])
+        arr = csv_qpos.numpy()
+        np.savetxt(val_dir / f"rollout_{i:03d}.csv", arr, delimiter=",", fmt="%.8f")
+
+    meta = {
+        "epoch": epoch,
+        "val_total_len": total_len,
+        "val_window_stride": stride,
+        "num_rollouts": n,
+        "csv_dir": str(val_dir),
+        "sample_mean": float(traj_denorm.mean().item()),
+        "sample_std": float(traj_denorm.std().item()),
+        "sample_min": float(traj_denorm.min().item()),
+        "sample_max": float(traj_denorm.max().item()),
     }
-    if metrics_path is not None:
-        metrics_path.write_text(json.dumps(metrics, indent=2))
-    return metrics
+    metrics_path = out_dir / f"eqm_lafan1_epoch_{epoch:03d}.json"
+    metrics_path.write_text(json.dumps(meta, indent=2))
+    return meta
+
+
+@torch.no_grad()
+def sliding_window_generate(
+    model: EqM,
+    config: Config,
+    device: torch.device,
+    cond_prefix: Float[Tensor, "batch cond dim"],
+    total_len: int,
+    window_stride: int,
+) -> Float[Tensor, "batch total dim"]:
+    """
+    Generate a trajectory longer than ``seq_len`` by repeatedly sampling a length-``seq_len``
+    window and advancing the window start by ``window_stride`` frames.
+
+    The stitched ``traj`` is stored in the **rollout root frame** (relative to timestep 0).
+    The model sees each window after :meth:`LAFAN1Dataset.make_relative` (relative to
+    ``ws``). New chunks are merged with :meth:`LAFAN1Dataset.accumulate_chunk_in_root_frame`
+    so root position and rot6d compose correctly; jpos/jvel pass through.
+
+    Require ``window_stride <= seq_len - cond_steps`` so the next prefix always lies in
+    frames already filled by the previous chunk (standard non-gap overlap condition).
+
+    Parameters
+    ----------
+    cond_prefix
+        Shape ``(N, cond_steps, D)`` in the same normalized space as training (e.g. after
+        ``make_relative`` and ``normalize``).
+    total_len
+        Target number of timesteps ``T`` (must be at least ``cond_steps``).
+    window_stride
+        Increment of the window start ``ws`` after each sample (smaller => more overlap).
+    """
+    k = model.cond_steps
+    seq_len = config.seq_len
+    if cond_prefix.ndim != 3 or cond_prefix.shape[1] != k:
+        raise ValueError(
+            f"cond_prefix must be (N, {k}, D), got {tuple(cond_prefix.shape)}"
+        )
+    if total_len < k:
+        raise ValueError(f"total_len ({total_len}) must be >= cond_steps ({k})")
+    if window_stride < 1:
+        raise ValueError("window_stride must be >= 1")
+    max_stride = seq_len - k
+    if max_stride < 1:
+        raise ValueError(
+            f"Need seq_len ({seq_len}) > cond_steps ({k}) to slide the window; "
+            "got no room to generate beyond the pinned prefix."
+        )
+    if window_stride > max_stride:
+        raise ValueError(
+            f"window_stride ({window_stride}) must be <= seq_len - cond_steps ({max_stride}) "
+            "so the next prefix stays inside the previous generated segment."
+        )
+
+    sample_fn = model.sample_nag if config.sample_sampler == "nag" else model.sample_gd
+    kwargs = (
+        {"mu": config.sample_mu}
+        if config.sample_sampler == "nag"
+        else {}
+    )
+    dtype = next(model.parameters()).dtype
+    n, _, dim = cond_prefix.shape
+    traj = torch.zeros(n, total_len, dim, device=device, dtype=dtype)
+    cond0 = cond_prefix.to(device=device, dtype=dtype)
+    traj[:, :k] = cond0
+
+    ws = 0
+    while True:
+        if ws + k > total_len:
+            break
+        # Stitched buffer is in the rollout root frame (relative to t=0). The model was
+        # trained on windows after make_relative, i.e. relative to each window's first frame.
+        traj_ws = traj[:, ws : ws + k]
+        cond_local = LAFAN1Dataset.make_relative(traj_ws)
+        root_pos_ref = traj[:, ws, :3]
+        root_rot6d_ref = traj[:, ws, 3:POSE_BASE_DIM]
+
+        chunk = sample_fn(
+            cond_prefix=cond_local,
+            seq_len=seq_len,
+            device=device,
+            num_steps=config.sample_steps,
+            stepsize=config.sample_stepsize,
+            **kwargs,
+        )
+        n_write = min(seq_len, total_len - ws)
+        chunk_merged = LAFAN1Dataset.accumulate_chunk_in_root_frame(
+            chunk[:, :n_write],
+            root_pos_ref,
+            root_rot6d_ref,
+        )
+        traj[:, ws : ws + n_write] = chunk_merged
+        if ws + n_write >= total_len:
+            break
+        ws += window_stride
+        if ws >= total_len:
+            break
+    
+    # TODO: convert from rot6d to quat_xyzw
+
+    return traj
 
 
 def _save_checkpoint(
@@ -278,7 +385,7 @@ def _first_normalized_batch(
     loader: DataLoader,
     dataset: LAFAN1Dataset,
     device: torch.device,
-) -> torch.Tensor:
+) -> Float[Tensor, "batch seq dim"]:
     x, _ = next(iter(loader))
     x = dataset.make_relative(x.to(device))
     x = dataset.normalize(x)
@@ -310,6 +417,18 @@ def main() -> None:
     parser.add_argument("--sample-mu", type=float, default=Config.sample_mu)
     parser.add_argument("--num-plot-samples", type=int, default=Config.num_plot_samples)
     parser.add_argument("--num-plot-dims", type=int, default=Config.num_plot_dims)
+    parser.add_argument(
+        "--val-total-len",
+        type=int,
+        default=Config.val_total_len,
+        help="Sliding-window validation rollout length (timesteps); CSV rows per rollout.",
+    )
+    parser.add_argument(
+        "--val-window-stride",
+        type=int,
+        default=None,
+        help="Stride between windows in validation (default: seq_len - cond_steps).",
+    )
     parser.add_argument("--no-download", action="store_true", help="Require local CSV clips; do not fetch from HF.")
     parser.add_argument(
         "--checkpoint",
@@ -343,10 +462,16 @@ def main() -> None:
         sample_mu=args.sample_mu,
         num_plot_samples=args.num_plot_samples,
         num_plot_dims=args.num_plot_dims,
+        val_total_len=args.val_total_len,
+        val_window_stride=args.val_window_stride,
         download=not args.no_download,
     )
     if not (1 <= config.cond_steps <= config.seq_len):
         raise ValueError(f"Need 1 <= cond-steps <= seq-len; got cond_steps={config.cond_steps}, seq_len={config.seq_len}")
+    if config.val_total_len < config.cond_steps:
+        raise ValueError(
+            f"val_total_len ({config.val_total_len}) must be >= cond_steps ({config.cond_steps})"
+        )
 
     torch.set_num_threads(max(config.num_threads, 1))
     torch.manual_seed(config.seed)
@@ -401,18 +526,16 @@ def main() -> None:
             losses.append(loss.item())
             pbar.set_postfix(loss=f"{loss.item():.5f}")
 
-        epoch_plot = out_dir / f"eqm_lafan1_epoch_{epoch:03d}.png"
-        epoch_metrics = out_dir / f"eqm_lafan1_epoch_{epoch:03d}.json"
         if reference_batch is None:
             reference_batch = _first_normalized_batch(loader, dataset, device)
-        metrics = sample_and_save(
+        metrics = save_validation_rollouts_csv(
             model,
             config,
             device,
             reference_batch,
             dataset,
-            epoch_plot,
-            epoch_metrics,
+            out_dir,
+            epoch,
         )
         _save_checkpoint(
             checkpoint_path,
@@ -429,25 +552,24 @@ def main() -> None:
                 f"sample_std={metrics['sample_std']:.6f}"
             )
 
-    out = out_dir / "eqm_lafan1_samples.png"
-    metrics_path = out_dir / "eqm_metrics.json"
     ref_final = (
         reference_batch
         if reference_batch is not None
         else _first_normalized_batch(loader, dataset, device)
     )
-    metrics = sample_and_save(
+    final_meta = save_validation_rollouts_csv(
         model,
         config,
         device,
         ref_final,
         dataset,
-        out,
-        metrics_path,
+        out_dir,
+        config.train_epochs,
     )
-    print(json.dumps(metrics, indent=2))
-    print("Saved per-epoch LAFAN1 samples and final metrics under examples/outputs")
-    print(f"Saved plot to {out}")
+    (out_dir / "eqm_metrics.json").write_text(json.dumps(final_meta, indent=2))
+    print(json.dumps(final_meta, indent=2))
+    print(f"Saved validation CSV rollouts under {out_dir / 'validation'}")
+    print(f"Latest summary: {out_dir / 'eqm_metrics.json'}")
 
 
 if __name__ == "__main__":

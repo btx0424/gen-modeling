@@ -2,9 +2,10 @@
 Robot motion datasets (e.g. LAFAN1 retargeted mocap).
 
 CSV rows are qpos only: ``[x, y, z, qw, qx, qy, qz, ...jpos]`` (free flyer + actuated joints),
-as in the LAFAN1 retargeting layout ``<root>/<robot>/*.csv``. After loading, joint velocities
-``jvel`` are appended per frame as finite differences of ``jpos`` times ``fps`` (same layout as
-many sim stacks: ``[qpos | jvel]``).
+as in the LAFAN1 retargeting layout ``<root>/<robot>/*.csv``. The root quaternion is converted
+to **6D rotation** (Zhou et al.: first two columns of ``R``, flattened). Joint velocities
+``jvel`` are appended per frame from ``jpos`` differences times ``fps``. Layout per frame:
+``[x,y,z, rot6d(6), jpos..., jvel...]``.
 """
 
 from __future__ import annotations
@@ -16,7 +17,12 @@ from typing import Literal
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from gen_modeling.utils.math import quat_conjugate, quat_mul
+from gen_modeling.utils.math import (
+    quat_to_rot6d,
+    quat_wxyz_to_xyzw,
+    rot6d_to_matrix,
+    rot6d_to_quat_wxyz,
+)
 
 RobotName = Literal["g1", "h1", "h1_2"]
 
@@ -24,8 +30,11 @@ LAFAN1_HF_REPO_ID = "lvhaidong/LAFAN1_Retargeting_Dataset"
 # Same name as the Hugging Face / git clone top-level folder (``g1/``, ``h1/``, … live under it).
 LAFAN1_REPO_DIRNAME = "LAFAN1_Retargeting_Dataset"
 
-# Base qpos layout: world position (3) + quaternion wxyz (4); remaining columns are jpos.
-QPOS_BASE_DIM = 7
+# Columns in CSV before joint positions: position (3) + quaternion (xyzw, 4).
+CSV_QPOS_BASE_DIM = 7
+# Processed trajectory layout per frame: position (3) + root rot6d (6) + jpos + jvel.
+ROOT_ROT6D_DIM = 6
+POSE_BASE_DIM = 3 + ROOT_ROT6D_DIM
 
 
 def _lafan1_base_with_clips(root: Path, robot: RobotName) -> Path | None:
@@ -74,7 +83,9 @@ class LAFAN1Dataset(Dataset):
     All clips are loaded into memory at construction (``float32``) to avoid disk I/O
     during training. Per-joint mean and population standard deviation are then computed
     over all frames in those clips for jpos and jvel; :meth:`normalize` / :meth:`denormalize`
-    apply them while leaving root position and quaternion unchanged.
+    apply them while leaving root position and root rot6d unchanged (rot6d is not z-scored).
+    Note that the original data's quaternions are in xyzw order. We convert them to wxyz order
+    to align with MuJoCo's convention.
 
     Parameters
     ----------
@@ -84,8 +95,8 @@ class LAFAN1Dataset(Dataset):
     robot
         Which robot / DoF layout to load.
     seq_len
-        Number of consecutive frames per sample, shape ``(seq_len, state_dim)`` where
-        ``state_dim = qpos_dim + n_joints`` (qpos from disk plus appended jvel).
+        Number of consecutive frames per sample, shape ``(seq_len, state_dim)`` with
+        ``state_dim = 9 + 2 * n_joints`` (pos + rot6d + jpos + jvel; ``n_joints`` from CSV).
     stride
         Frame stride between consecutive windows within the same clip.
     fps
@@ -132,12 +143,12 @@ class LAFAN1Dataset(Dataset):
         self.dtype = dtype
 
         qpos_dim = self.QPOS_DIM[robot]
-        n_joints = qpos_dim - QPOS_BASE_DIM
+        n_joints = qpos_dim - CSV_QPOS_BASE_DIM
         if n_joints < 1:
             raise ValueError(f"robot {robot!r}: expected at least one joint column in qpos")
         self.qpos_dim = qpos_dim
         self.n_joints = n_joints
-        self.state_dim = qpos_dim + n_joints
+        self.state_dim = POSE_BASE_DIM + 2 * n_joints
 
         resolved = _lafan1_base_with_clips(self.root, robot)
         if resolved is not None:
@@ -167,7 +178,7 @@ class LAFAN1Dataset(Dataset):
                 f"No windows of length {seq_len} in {clip_dir}; all clips are too short."
             )
 
-        lo = QPOS_BASE_DIM
+        lo = POSE_BASE_DIM
         mid = lo + n_joints
         all_frames = torch.cat(self._clips, dim=0)
         jpos_block = all_frames[:, lo:mid]
@@ -177,10 +188,6 @@ class LAFAN1Dataset(Dataset):
         self._jpos_std = jpos_block.std(dim=0, correction=0).clamp_min(eps)
         self._jvel_mean = jvel_block.mean(dim=0)
         self._jvel_std = jvel_block.std(dim=0, correction=0).clamp_min(eps)
-        print(f"jpos_mean: {self._jpos_mean}")
-        print(f"jpos_std: {self._jpos_std}")
-        print(f"jvel_mean: {self._jvel_mean}")
-        print(f"jvel_std: {self._jvel_std}")
 
         self._window_offsets: list[int] = [0]
         for w in windows_per_clip:
@@ -211,39 +218,86 @@ class LAFAN1Dataset(Dataset):
     @staticmethod
     def process_data(qpos: np.ndarray, fps: float) -> torch.Tensor:
         """
-        Append per-frame jvel from jpos: backward difference in time, ``(jpos[t]-jpos[t-1])*fps``,
-        with the first frame using the same segment as frame 1 (forward difference from t=0).
+        Root orientation as rot6d (from normalized quaternion wxyz); append jvel from jpos.
         """
-        root_pos = qpos[:, :3]
-        root_quat_xyzw = qpos[:, 3:7]
-        root_quat_wxyz = root_quat_xyzw[:, [3, 0, 1, 2]]
-        jpos = qpos[:, QPOS_BASE_DIM:]
-        t, j = jpos.shape
-        jvel = np.empty((t, j))
-        if t < 2:
-            jvel.fill(0.0)
-        else:
-            delta0 = (jpos[1] - jpos[0]) * fps
-            jvel[0] = delta0
-            jvel[1:] = (jpos[1:] - jpos[:-1]) * fps
-        processed = np.concatenate([root_pos, root_quat_wxyz, jpos, jvel], axis=1, dtype=np.float32)
-        return torch.from_numpy(processed)
+        x = torch.as_tensor(qpos, dtype=torch.float32)
+        root_pos = x[:, :3]
+        xyzw = x[:, 3:7]
+        wxyz = xyzw[:, [3, 0, 1, 2]]
+        wxyz = wxyz / wxyz.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        root_rot6d = quat_to_rot6d(wxyz)
+        jpos = x[:, CSV_QPOS_BASE_DIM:]
+        t_rows, j = jpos.shape
+        jvel = torch.zeros((t_rows, j), dtype=x.dtype, device=x.device)
+        if t_rows >= 2:
+            fp = float(fps)
+            jvel[0] = (jpos[1] - jpos[0]) * fp
+            jvel[1:] = (jpos[1:] - jpos[:-1]) * fp
+        return torch.cat([root_pos, root_rot6d, jpos, jvel], dim=1)
     
     @staticmethod
     def make_relative(trajectory: torch.Tensor) -> torch.Tensor:
         root_pos = trajectory[..., :3]
-        root_quat_wxyz = trajectory[..., 3:7]
+        root_rot6d = trajectory[..., 3:POSE_BASE_DIM]
         root_pos = root_pos - root_pos[..., 0:1, :]
-        root_quat_wxyz = quat_mul(
-            quat_conjugate(root_quat_wxyz[..., 0:1, :]).expand_as(root_quat_wxyz),
-            root_quat_wxyz
-        )
-        jpos_jvel = trajectory[..., QPOS_BASE_DIM:]
-        return torch.cat([root_pos, root_quat_wxyz, jpos_jvel], dim=-1)
-    
+        R = rot6d_to_matrix(root_rot6d)
+        R0 = R[..., 0:1, :, :]
+        R_rel = torch.matmul(R0.transpose(-1, -2), R)
+        root_rot6d_rel = R_rel[..., :2].reshape(*R.shape[:-2], ROOT_ROT6D_DIM)
+        jpos_jvel = trajectory[..., POSE_BASE_DIM:]
+        return torch.cat([root_pos, root_rot6d_rel, jpos_jvel], dim=-1)
+
+    @staticmethod
+    def accumulate_chunk_in_root_frame(
+        chunk_local: torch.Tensor,
+        root_pos_ref: torch.Tensor,
+        root_rot6d_ref: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Map a chunk expressed **relative to its first frame** (same convention as
+        :meth:`make_relative` output) into the **rollout root frame** used by ``traj``:
+        positions and rotations are relative to timestep 0 of the full trajectory.
+
+        Joint blocks (jpos, jvel) are copied unchanged.
+
+        Parameters
+        ----------
+        chunk_local
+            ``(..., T, D)`` with root pos/rot6d relative to frame 0 of this chunk.
+        root_pos_ref, root_rot6d_ref
+            Global-encoding root pose at that chunk's frame 0, ``(..., 3)`` and ``(..., 6)``.
+        """
+        pos_l = chunk_local[..., :3]
+        rot6d_l = chunk_local[..., 3:POSE_BASE_DIM]
+        tail = chunk_local[..., POSE_BASE_DIM:]
+        R_ref = rot6d_to_matrix(root_rot6d_ref)
+        R_l = rot6d_to_matrix(rot6d_l)
+        pos_g = pos_l + root_pos_ref.unsqueeze(-2)
+        R_g = torch.matmul(R_ref.unsqueeze(-3), R_l)
+        rot6d_g = R_g[..., :2].reshape(*R_g.shape[:-2], ROOT_ROT6D_DIM)
+        return torch.cat([pos_g, rot6d_g, tail], dim=-1)
+
+    def trajectory_to_lafan1_csv_qpos(self, traj: torch.Tensor) -> torch.Tensor:
+        """
+        Convert a processed trajectory (root pos, rot6d, jpos, jvel) to the retargeting CSV
+        **qpos** row layout: ``[x, y, z, qx, qy, qz, qw]`` (translation + quaternion **xyzw** +
+        ``jpos``). **jvel is dropped** — original clips do not store it.
+        """
+        expected = POSE_BASE_DIM + 2 * self.n_joints
+        if traj.shape[-1] != expected:
+            raise ValueError(
+                f"trajectory last dim must be {expected} (state_dim), got {traj.shape[-1]}"
+            )
+        pos = traj[..., :3]
+        rot6d = traj[..., 3:POSE_BASE_DIM]
+        jpos = traj[..., POSE_BASE_DIM : POSE_BASE_DIM + self.n_joints]
+        q_wxyz = rot6d_to_quat_wxyz(rot6d)
+        q_xyzw = quat_wxyz_to_xyzw(q_wxyz)
+        return torch.cat([pos, q_xyzw, jpos], dim=-1)
+
     def normalize(self, trajectory: torch.Tensor) -> torch.Tensor:
-        """Scale jpos and jvel to roughly zero mean / unit variance; root pos and quat unchanged."""
-        lo = QPOS_BASE_DIM
+        """Scale jpos and jvel to roughly zero mean / unit variance; root pos and rot6d unchanged."""
+        lo = POSE_BASE_DIM
         mid = lo + self.n_joints
         out = trajectory.clone()
         device, dtype = trajectory.device, trajectory.dtype
@@ -255,7 +309,7 @@ class LAFAN1Dataset(Dataset):
 
     def denormalize(self, trajectory: torch.Tensor) -> torch.Tensor:
         """Inverse of :meth:`normalize` for jpos and jvel blocks."""
-        lo = QPOS_BASE_DIM
+        lo = POSE_BASE_DIM
         mid = lo + self.n_joints
         out = trajectory.clone()
         device, dtype = trajectory.device, trajectory.dtype
