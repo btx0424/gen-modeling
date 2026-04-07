@@ -18,8 +18,11 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from gen_modeling.utils.math import (
+    quat_conjugate,
+    quat_mul,
     quat_to_rot6d,
     quat_wxyz_to_xyzw,
+    rot6d_from_matrix,
     rot6d_to_matrix,
     rot6d_to_quat_wxyz,
 )
@@ -126,6 +129,7 @@ class LAFAN1Dataset(Dataset):
         fps: float = 30.0,
         dtype: torch.dtype = torch.float32,
         download: bool = True,
+        rot6d: bool = True
     ) -> None:
         super().__init__()
         if seq_len < 1:
@@ -141,6 +145,7 @@ class LAFAN1Dataset(Dataset):
         self.stride = stride
         self.fps = float(fps)
         self.dtype = dtype
+        self.rot6d = rot6d
 
         qpos_dim = self.QPOS_DIM[robot]
         n_joints = qpos_dim - CSV_QPOS_BASE_DIM
@@ -215,8 +220,7 @@ class LAFAN1Dataset(Dataset):
         }
         return chunk, meta
     
-    @staticmethod
-    def process_data(qpos: np.ndarray, fps: float) -> torch.Tensor:
+    def process_data(self, qpos: np.ndarray, fps: float) -> torch.Tensor:
         """
         Root orientation as rot6d (from normalized quaternion wxyz); append jvel from jpos.
         """
@@ -225,7 +229,10 @@ class LAFAN1Dataset(Dataset):
         xyzw = x[:, 3:7]
         wxyz = xyzw[:, [3, 0, 1, 2]]
         wxyz = wxyz / wxyz.norm(dim=1, keepdim=True).clamp_min(1e-8)
-        root_rot6d = quat_to_rot6d(wxyz)
+        if self.rot6d:
+            root_rot = quat_to_rot6d(wxyz)
+        else:
+            root_rot = wxyz
         jpos = x[:, CSV_QPOS_BASE_DIM:]
         t_rows, j = jpos.shape
         jvel = torch.zeros((t_rows, j), dtype=x.dtype, device=x.device)
@@ -233,19 +240,29 @@ class LAFAN1Dataset(Dataset):
             fp = float(fps)
             jvel[0] = (jpos[1] - jpos[0]) * fp
             jvel[1:] = (jpos[1:] - jpos[:-1]) * fp
-        return torch.cat([root_pos, root_rot6d, jpos, jvel], dim=1)
+        return torch.cat([root_pos, root_rot, jpos, jvel], dim=1)
     
-    @staticmethod
-    def make_relative(trajectory: torch.Tensor) -> torch.Tensor:
+    def make_relative(self, trajectory: torch.Tensor) -> torch.Tensor:
         root_pos = trajectory[..., :3]
-        root_rot6d = trajectory[..., 3:POSE_BASE_DIM]
-        root_pos = root_pos - root_pos[..., 0:1, :]
-        R = rot6d_to_matrix(root_rot6d)
-        R0 = R[..., 0:1, :, :]
-        R_rel = torch.matmul(R0.transpose(-1, -2), R)
-        root_rot6d_rel = R_rel[..., :2].reshape(*R.shape[:-2], ROOT_ROT6D_DIM)
-        jpos_jvel = trajectory[..., POSE_BASE_DIM:]
-        return torch.cat([root_pos, root_rot6d_rel, jpos_jvel], dim=-1)
+        root_pos_rel = root_pos - root_pos[..., 0:1, :]
+        if self.rot6d:
+            jstates = trajectory[..., 9:]
+            root_rot6d = trajectory[..., 3:9]
+            R = rot6d_to_matrix(root_rot6d)
+            R0 = R[..., 0:1, :, :]
+            R_rel = torch.matmul(R0.transpose(-1, -2), R)
+            root_rot6d_rel = rot6d_from_matrix(R_rel)
+            result = torch.cat([root_pos_rel, root_rot6d_rel, jstates], dim=-1)
+        else:
+            jstates = trajectory[..., 7:]
+            root_wxyz = trajectory[..., 3:7]
+            root_wxyz_0 = root_wxyz[..., 0:1, :]
+            root_wxyz_rel = quat_mul(
+                quat_conjugate(root_wxyz_0).expand_as(root_wxyz),
+                root_wxyz
+            )
+            result = torch.cat([root_pos_rel, root_wxyz_rel, jstates], dim=-1)
+        return result
 
     @staticmethod
     def accumulate_chunk_in_root_frame(
@@ -274,7 +291,7 @@ class LAFAN1Dataset(Dataset):
         R_l = rot6d_to_matrix(rot6d_l)
         pos_g = pos_l + root_pos_ref.unsqueeze(-2)
         R_g = torch.matmul(R_ref.unsqueeze(-3), R_l)
-        rot6d_g = R_g[..., :2].reshape(*R_g.shape[:-2], ROOT_ROT6D_DIM)
+        rot6d_g = rot6d_from_matrix(R_g)
         return torch.cat([pos_g, rot6d_g, tail], dim=-1)
 
     def trajectory_to_lafan1_csv_qpos(self, traj: torch.Tensor) -> torch.Tensor:
@@ -283,17 +300,25 @@ class LAFAN1Dataset(Dataset):
         **qpos** row layout: ``[x, y, z, qx, qy, qz, qw]`` (translation + quaternion **xyzw** +
         ``jpos``). **jvel is dropped** — original clips do not store it.
         """
-        expected = POSE_BASE_DIM + 2 * self.n_joints
+        if self.rot6d:
+            expected = 9 + 2 * self.n_joints
+        else:
+            expected = 7 + 2 * self.n_joints
         if traj.shape[-1] != expected:
             raise ValueError(
                 f"trajectory last dim must be {expected} (state_dim), got {traj.shape[-1]}"
             )
         pos = traj[..., :3]
-        rot6d = traj[..., 3:POSE_BASE_DIM]
-        jpos = traj[..., POSE_BASE_DIM : POSE_BASE_DIM + self.n_joints]
-        q_wxyz = rot6d_to_quat_wxyz(rot6d)
-        q_xyzw = quat_wxyz_to_xyzw(q_wxyz)
-        return torch.cat([pos, q_xyzw, jpos], dim=-1)
+        if self.rot6d:
+            rot6d = traj[..., 3:9]
+            quat_wxyz = rot6d_to_quat_wxyz(rot6d)
+            quat_xyzw = quat_wxyz_to_xyzw(quat_wxyz)
+            jpos = traj[..., 9:9 + self.n_joints]
+        else:
+            quat_wxyz = traj[..., 3:7]
+            quat_xyzw = quat_wxyz_to_xyzw(quat_wxyz)
+            jpos = traj[..., 7:7 + self.n_joints]
+        return torch.cat([pos, quat_xyzw, jpos], dim=-1)
 
     def normalize(self, trajectory: torch.Tensor) -> torch.Tensor:
         """Scale jpos and jvel to roughly zero mean / unit variance; root pos and rot6d unchanged."""

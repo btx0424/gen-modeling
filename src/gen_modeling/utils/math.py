@@ -8,6 +8,12 @@ def quat_normalize_wxyz(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return q / n
 
 
+def quat_standardize_wxyz(q: torch.Tensor) -> torch.Tensor:
+    """Pick a deterministic representative by enforcing non-negative scalar part ``w``."""
+    sign = torch.where(q[..., :1] < 0, -1.0, 1.0).to(dtype=q.dtype, device=q.device)
+    return q * sign
+
+
 def quat_rotate(quat_wxyz: torch.Tensor, vec: torch.Tensor):
     """Apply a quaternion rotation to a vector.
 
@@ -126,7 +132,12 @@ def quat_to_rot6d(quat_wxyz: torch.Tensor):
     Take the first two columns of the rotation matrix and flatten.
     """
     mat = matrix_from_quat(quat_wxyz)
-    return mat[..., :2].flatten(start_dim=-2)
+    return rot6d_from_matrix(mat)
+
+
+def rot6d_from_matrix(matrix: torch.Tensor) -> torch.Tensor:
+    """Take the first two matrix columns and pack as 6D rotation representation."""
+    return matrix[..., :2].transpose(-1, -2).flatten(start_dim=-2)
 
 
 def rot6d_to_matrix(d6):
@@ -191,9 +202,10 @@ def quat_from_matrix(matrix: torch.Tensor) -> torch.Tensor:
 
     # if not for numerical problems, quat_candidates[i] should be same (up to a sign),
     # forall i; we pick the best-conditioned one (with the largest denominator)
-    return quat_candidates[torch.nn.functional.one_hot(q_abs.argmax(dim=-1), num_classes=4) > 0.5, :].reshape(
+    quat = quat_candidates[torch.nn.functional.one_hot(q_abs.argmax(dim=-1), num_classes=4) > 0.5, :].reshape(
         batch_dim + (4,)
     )
+    return quat_standardize_wxyz(quat_normalize_wxyz(quat))
 
 
 def rot6d_to_quat_wxyz(d6: torch.Tensor) -> torch.Tensor:
