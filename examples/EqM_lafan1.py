@@ -27,7 +27,12 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from gen_modeling.datasets.robotics import LAFAN1Dataset, POSE_BASE_DIM, RobotName
+from gen_modeling.datasets.robotics import (
+    LAFAN1Dataset,
+    POSE_BASE_DIM,
+    ROOT_ROT_OFFSET,
+    RobotName,
+)
 from gen_modeling.modules import ConditionalUNet1D
 from gen_modeling.utils.optim import MuonAdamWWrapper
 
@@ -237,6 +242,7 @@ def save_validation_rollouts_csv(
         "sample_min": float(traj_denorm.min().item()),
         "sample_max": float(traj_denorm.max().item()),
     }
+    meta.update(dataset.compute_metrics(traj_denorm))
     metrics_path = out_dir / f"eqm_lafan1_epoch_{epoch:03d}.json"
     metrics_path.write_text(json.dumps(meta, indent=2))
     return meta
@@ -314,7 +320,7 @@ def sliding_window_generate(
         traj_ws = traj[:, ws : ws + k]
         cond_local = dataset.normalize(dataset.make_relative(traj_ws))
         root_pos_ref = traj[:, ws, :3]
-        root_rot6d_ref = traj[:, ws, 3:POSE_BASE_DIM]
+        root_rot6d_ref = traj[:, ws, ROOT_ROT_OFFSET:POSE_BASE_DIM]
 
         chunk = sample_fn(
             cond_prefix=cond_local,
@@ -547,7 +553,9 @@ def main() -> None:
             print(
                 f"epoch {epoch}: "
                 f"loss={avg_loss:.6f}, "
-                f"sample_std={metrics['sample_std']:.6f}"
+                f"sample_std={metrics['sample_std']:.6f}, "
+                f"root_vel_fd_mse={metrics['root_vel_fd_mse']:.6f}, "
+                f"joint_vel_fd_mse={metrics['joint_vel_fd_mse']:.6f}"
             )
             if wandb_run is not None:
                 wandb_run.log(
@@ -558,6 +566,8 @@ def main() -> None:
                         "val/sample_std": float(metrics["sample_std"]),
                         "val/sample_min": float(metrics["sample_min"]),
                         "val/sample_max": float(metrics["sample_max"]),
+                        "val/root_vel_fd_mse": float(metrics["root_vel_fd_mse"]),
+                        "val/joint_vel_fd_mse": float(metrics["joint_vel_fd_mse"]),
                     },
                     step=epoch,
                 )
@@ -580,6 +590,8 @@ def main() -> None:
                 "final/sample_std": float(final_meta["sample_std"]),
                 "final/sample_min": float(final_meta["sample_min"]),
                 "final/sample_max": float(final_meta["sample_max"]),
+                "final/root_vel_fd_mse": float(final_meta["root_vel_fd_mse"]),
+                "final/joint_vel_fd_mse": float(final_meta["joint_vel_fd_mse"]),
             },
             step=config.train_epochs,
         )
