@@ -56,8 +56,7 @@ class Config:
     val_total_len: int = 128
     val_window_stride: int | None = None
     download: bool = True
-    use_wandb: bool = False
-    wandb_run_name: str | None = None
+    use_wandb: bool = True
 
 
 def eqm_ct(a: float = 0.8, grad_scale: float = 4.0):
@@ -419,13 +418,6 @@ def main() -> None:
         help="Stride between windows in validation (default: seq_len - cond_steps).",
     )
     parser.add_argument("--no-download", action="store_true", help="Require local CSV clips; do not fetch from HF.")
-    parser.add_argument("--use-wandb", action="store_true", help="Enable Weights & Biases logging.")
-    parser.add_argument(
-        "--wandb-run-name",
-        type=str,
-        default=None,
-        help="Optional W&B run name.",
-    )
     parser.add_argument(
         "--checkpoint",
         type=str,
@@ -462,8 +454,6 @@ def main() -> None:
         val_total_len=args.val_total_len,
         val_window_stride=args.val_window_stride,
         download=not args.no_download,
-        use_wandb=args.use_wandb,
-        wandb_run_name=args.wandb_run_name,
     )
     if not (1 <= config.cond_steps <= config.seq_len):
         raise ValueError(f"Need 1 <= cond-steps <= seq-len; got cond_steps={config.cond_steps}, seq_len={config.seq_len}")
@@ -503,7 +493,7 @@ def main() -> None:
     if config.use_wandb:
         wandb_run = wandb.init(
             project="gen-modeling",
-            name=config.wandb_run_name,
+            name=f"EqM_lafan1",
             config=dataclasses.asdict(config),
         )
     out_dir = Path(__file__).resolve().parent / "outputs" / "EqM_lafan1"
@@ -593,6 +583,13 @@ def main() -> None:
             },
             step=config.train_epochs,
         )
+        if checkpoint_path.is_file():
+            artifact = wandb.Artifact(
+                name=f"eqm_lafan1_checkpoint_{wandb_run.id}",
+                type="model",
+            )
+            artifact.add_file(str(checkpoint_path), name="checkpoint.pt")
+            wandb_run.log_artifact(artifact)
         wandb_run.finish()
     print(json.dumps(final_meta, indent=2))
     print(f"Saved validation CSV rollouts under {out_dir / 'validation'}")

@@ -13,6 +13,7 @@ from __future__ import annotations
 import bisect
 from pathlib import Path
 from typing import Literal
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -201,7 +202,7 @@ class LAFAN1Dataset(Dataset):
         self._jvel_std = jvel_block.std(dim=0, correction=0).clamp_min(eps)
 
         rel_root_rows: list[torch.Tensor] = []
-        for clip in self._clips:
+        for clip in tqdm(self._clips, desc="Computing statistics"):
             t_rows = clip.shape[0]
             for start in range(0, t_rows - seq_len + 1, stride):
                 chunk = clip[start : start + seq_len]
