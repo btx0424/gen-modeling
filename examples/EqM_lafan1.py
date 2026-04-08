@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import wandb
 from jaxtyping import Float
 from torch import Tensor
 from torch.utils.data import DataLoader
@@ -28,6 +29,7 @@ from tqdm import tqdm
 
 from gen_modeling.datasets.robotics import LAFAN1Dataset, POSE_BASE_DIM, RobotName
 from gen_modeling.modules import ConditionalUNet1D
+from gen_modeling.utils.optim import MuonAdamWWrapper
 
 
 @dataclass
@@ -44,6 +46,7 @@ class Config:
     seed: int = 42
     train_epochs: int = 50
     lr: float = 3e-4
+    use_muon_adamw: bool = False
     sample_steps: int = 80
     sample_stepsize: float = 0.01
     sample_sampler: Literal["gd", "nag"] = "nag"
@@ -53,6 +56,8 @@ class Config:
     val_total_len: int = 128
     val_window_stride: int | None = None
     download: bool = True
+    use_wandb: bool = False
+    wandb_run_name: str | None = None
 
 
 def eqm_ct(a: float = 0.8, grad_scale: float = 4.0):
@@ -390,6 +395,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--train-epochs", type=int, default=Config.train_epochs)
     parser.add_argument("--lr", type=float, default=Config.lr)
+    parser.add_argument(
+        "--use-muon-adamw",
+        action="store_true",
+        help="Use MuonAdamWWrapper instead of plain AdamW.",
+    )
     parser.add_argument("--sample-steps", type=int, default=Config.sample_steps)
     parser.add_argument("--sample-stepsize", type=float, default=Config.sample_stepsize)
     parser.add_argument("--sample-sampler", choices=["gd", "nag"], default=Config.sample_sampler)
@@ -409,6 +419,13 @@ def main() -> None:
         help="Stride between windows in validation (default: seq_len - cond_steps).",
     )
     parser.add_argument("--no-download", action="store_true", help="Require local CSV clips; do not fetch from HF.")
+    parser.add_argument("--use-wandb", action="store_true", help="Enable Weights & Biases logging.")
+    parser.add_argument(
+        "--wandb-run-name",
+        type=str,
+        default=None,
+        help="Optional W&B run name.",
+    )
     parser.add_argument(
         "--checkpoint",
         type=str,
@@ -435,6 +452,7 @@ def main() -> None:
         seed=args.seed,
         train_epochs=args.train_epochs,
         lr=args.lr,
+        use_muon_adamw=args.use_muon_adamw,
         sample_steps=args.sample_steps,
         sample_stepsize=args.sample_stepsize,
         sample_sampler=args.sample_sampler,
@@ -444,6 +462,8 @@ def main() -> None:
         val_total_len=args.val_total_len,
         val_window_stride=args.val_window_stride,
         download=not args.no_download,
+        use_wandb=args.use_wandb,
+        wandb_run_name=args.wandb_run_name,
     )
     if not (1 <= config.cond_steps <= config.seq_len):
         raise ValueError(f"Need 1 <= cond-steps <= seq-len; got cond_steps={config.cond_steps}, seq_len={config.seq_len}")
@@ -475,7 +495,17 @@ def main() -> None:
         ),
         cond_steps=config.cond_steps,
     ).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=config.lr)
+    if config.use_muon_adamw:
+        optimizer = MuonAdamWWrapper([model], lr=config.lr)
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=config.lr)
+    wandb_run = None
+    if config.use_wandb:
+        wandb_run = wandb.init(
+            project="gen-modeling",
+            name=config.wandb_run_name,
+            config=dataclasses.asdict(config),
+        )
     out_dir = Path(__file__).resolve().parent / "outputs" / "EqM_lafan1"
     out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else out_dir / "checkpoint.pt"
@@ -523,11 +553,24 @@ def main() -> None:
             config=config,
         )
         if losses:
+            avg_loss = float(np.mean(losses))
             print(
                 f"epoch {epoch}: "
-                f"loss={np.mean(losses):.6f}, "
+                f"loss={avg_loss:.6f}, "
                 f"sample_std={metrics['sample_std']:.6f}"
             )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "train/loss": avg_loss,
+                        "train/lr": float(optimizer.param_groups[0]["lr"]),
+                        "val/sample_mean": float(metrics["sample_mean"]),
+                        "val/sample_std": float(metrics["sample_std"]),
+                        "val/sample_min": float(metrics["sample_min"]),
+                        "val/sample_max": float(metrics["sample_max"]),
+                    },
+                    step=epoch,
+                )
 
     ref_final = reference_batch
     final_meta = save_validation_rollouts_csv(
@@ -540,6 +583,17 @@ def main() -> None:
         config.train_epochs,
     )
     (out_dir / "eqm_metrics.json").write_text(json.dumps(final_meta, indent=2))
+    if wandb_run is not None:
+        wandb_run.log(
+            {
+                "final/sample_mean": float(final_meta["sample_mean"]),
+                "final/sample_std": float(final_meta["sample_std"]),
+                "final/sample_min": float(final_meta["sample_min"]),
+                "final/sample_max": float(final_meta["sample_max"]),
+            },
+            step=config.train_epochs,
+        )
+        wandb_run.finish()
     print(json.dumps(final_meta, indent=2))
     print(f"Saved validation CSV rollouts under {out_dir / 'validation'}")
     print(f"Latest summary: {out_dir / 'eqm_metrics.json'}")

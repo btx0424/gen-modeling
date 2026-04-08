@@ -1,0 +1,150 @@
+import torch
+import warnings
+
+
+class OptimizerGroup(torch.optim.Optimizer):
+    """
+    Wrapper around multiple optimizers so they can be used through a single
+    optimizer-like interface (step/zero_grad/param_groups).
+    """
+
+    def __init__(self, optimizers: list[torch.optim.Optimizer]):
+        if len(optimizers) == 0:
+            raise ValueError("OptimizerGroup requires at least one optimizer.")
+
+        # Collect all parameters from the wrapped optimizers so that the base
+        # Optimizer constructor is satisfied (it disallows an empty parameter
+        # list). We won't use the base step/zero_grad implementations, only
+        # some of its bookkeeping.
+        all_params = []
+        for opt in optimizers:
+            for group in opt.param_groups:
+                all_params.extend(group["params"])
+        if len(all_params) == 0:
+            raise ValueError("OptimizerGroup underlying optimizers have no parameters.")
+
+        super().__init__(params=all_params, defaults={})
+        self.optimizers = optimizers
+
+        # Flatten the underlying param_groups so external code can keep using
+        # `opt.param_groups[0]['lr']` etc. These dict objects come from the
+        # wrapped optimizers, so mutating them here updates those optimizers.
+        self.param_groups = []
+        for opt in self.optimizers:
+            self.param_groups.extend(opt.param_groups)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Run a single optimization step for all wrapped optimizers.
+
+        Args:
+            closure: Optional reevaluation closure. If provided, it is passed
+                only to the first optimizer to preserve typical PyTorch
+                semantics.
+
+        Returns:
+            The first non-``None`` loss returned by wrapped optimizers, or the
+            closure loss when a closure is provided.
+        """
+        loss = None
+        if closure is not None:
+            # Use the closure with the first optimizer to preserve semantics,
+            # then step the remaining optimizers without a closure.
+            loss = self.optimizers[0].step(closure)
+            for opt in self.optimizers[1:]:
+                opt.step()
+            return loss
+
+        for opt in self.optimizers:
+            _loss = opt.step()
+            if loss is None:
+                loss = _loss
+        return loss
+
+    def zero_grad(self, set_to_none: bool | None = None):
+        """Clear gradients for all wrapped optimizers."""
+        for opt in self.optimizers:
+            if set_to_none is None:
+                opt.zero_grad()
+            else:
+                opt.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        """Serialize wrapped optimizer states.
+
+        Returns:
+            A dict containing a list of optimizer state dicts.
+        """
+        # Simple, explicit format: a list of state dicts for the wrapped
+        # optimizers.
+        return {
+            "optimizers": [opt.state_dict() for opt in self.optimizers],
+            "class": self.__class__.__name__,
+        }
+
+    def load_state_dict(self, state_dict):
+        """Load states into wrapped optimizers.
+
+        If the checkpoint contains fewer/more optimizer entries than this
+        instance, states are loaded for the matching prefix and a warning is
+        emitted.
+        """
+        opt_states = state_dict.get("optimizers", None)
+        if opt_states is None:
+            warnings.warn(
+                "OptimizerGroup state dict does not contain an 'optimizers' key. "
+                "Skipping optimizer state restore."
+            )
+            return
+        if len(opt_states) != len(self.optimizers):
+            warnings.warn(
+                f"OptimizerGroup state has {len(opt_states)} optimizers, "
+                f"but current instance has {len(self.optimizers)}. "
+                "Loading states for the matching prefix only."
+            )
+        for opt, opt_state in zip(self.optimizers, opt_states):
+            opt.load_state_dict(opt_state)
+
+
+class MuonAdamWWrapper(OptimizerGroup):
+    """Split parameters between Muon and AdamW, then optimize jointly.
+
+    Parameters are partitioned by tensor rank:
+    - 2D tensors -> ``torch.optim.Muon`` (typically matrix-like weights)
+    - all others -> ``torch.optim.AdamW`` (biases, vectors, embeddings, etc.)
+    """
+
+    def __init__(
+        self,
+        modules: list[torch.nn.Module],
+        lr: float,
+        weight_decay: float = 0.01,
+    ):
+        """Create a mixed Muon/AdamW optimizer wrapper.
+
+        Args:
+            modules: Modules whose parameters should be optimized.
+            lr: Learning rate used for both Muon and AdamW groups.
+            weight_decay: Weight decay applied to AdamW-managed parameters.
+        """
+        seen: set[int] = set()
+        muon_params: list[torch.nn.Parameter] = []
+        adamw_params: list[torch.nn.Parameter] = []
+        for module in modules:
+            for p in module.parameters():
+                if id(p) in seen:
+                    continue
+                seen.add(id(p))
+                if p.dim() == 2:
+                    muon_params.append(p)
+                else:
+                    adamw_params.append(p)
+
+        optimizers = []
+        if len(muon_params) > 0:
+            muon = torch.optim.Muon(muon_params, lr=lr, adjust_lr_fn="match_rms_adamw")
+            optimizers.append(muon)
+        if len(adamw_params) > 0:
+            adamw = torch.optim.AdamW(adamw_params, lr=lr, weight_decay=weight_decay)
+            optimizers.append(adamw)
+        super().__init__(optimizers)

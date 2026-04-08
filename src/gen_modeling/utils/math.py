@@ -14,6 +14,52 @@ def quat_standardize_wxyz(q: torch.Tensor) -> torch.Tensor:
     return q * sign
 
 
+def yaw_quat(quat_wxyz: torch.Tensor) -> torch.Tensor:
+    """Extract the yaw component of a quaternion.
+
+    Args:
+        quat_wxyz: The orientation in (w, x, y, z). Shape is (..., 4)
+
+    Returns:
+        A quaternion with only yaw component.
+    """
+    shape = quat_wxyz.shape
+    quat_yaw = quat_wxyz.view(-1, 4)
+    qw = quat_yaw[:, 0]
+    qx = quat_yaw[:, 1]
+    qy = quat_yaw[:, 2]
+    qz = quat_yaw[:, 3]
+    yaw = torch.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
+    quat_yaw = torch.zeros_like(quat_yaw)
+    quat_yaw[:, 3] = torch.sin(yaw / 2)
+    quat_yaw[:, 0] = torch.cos(yaw / 2)
+    quat_yaw = quat_normalize_wxyz(quat_yaw)
+    return quat_yaw.view(shape)
+
+
+def yaw_matrix(matrix: torch.Tensor) -> torch.Tensor:
+    """Extract the yaw component of a rotation matrix.
+
+    Args:
+        matrix: The rotation matrix. Shape is (..., 3, 3).
+
+    Returns:
+        A rotation matrix with only yaw component.
+    """
+    if matrix.size(-1) != 3 or matrix.size(-2) != 3:
+        raise ValueError(f"Invalid rotation matrix shape {matrix.shape}.")
+    yaw = torch.atan2(matrix[..., 1, 0], matrix[..., 0, 0])
+    c = torch.cos(yaw)
+    s = torch.sin(yaw)
+    out = torch.zeros_like(matrix)
+    out[..., 0, 0] = c
+    out[..., 0, 1] = -s
+    out[..., 1, 0] = s
+    out[..., 1, 1] = c
+    out[..., 2, 2] = 1.0
+    return out
+
+
 def quat_rotate(quat_wxyz: torch.Tensor, vec: torch.Tensor):
     """Apply a quaternion rotation to a vector.
 

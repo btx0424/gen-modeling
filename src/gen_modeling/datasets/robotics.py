@@ -18,6 +18,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from gen_modeling.utils.math import (
+    yaw_quat,
+    yaw_matrix,
     quat_conjugate,
     quat_mul,
     quat_rotate,
@@ -257,14 +259,44 @@ class LAFAN1Dataset(Dataset):
             jvel[1:] = (jpos[1:] - jpos[:-1]) * fp
         return torch.cat([root_pos, root_rot, jpos, jvel], dim=1)
     
-    def make_relative(self, trajectory: torch.Tensor) -> torch.Tensor:
+    def make_relative(
+        self,
+        trajectory: torch.Tensor,
+        xy_only: bool = True,
+        yaw_only: bool = False,
+    ) -> torch.Tensor:
+        """
+        Express a trajectory in the first-frame root coordinate system.
+
+        Root translation is offset by frame 0 and then rotated by the inverse of the
+        frame-0 root orientation. If ``xy_only`` is ``True`` (default), only ``x/y`` are
+        offset in world space before this rotation (``z`` keeps its absolute value);
+        if ``xy_only`` is ``False``, all ``x/y/z`` components are offset.
+
+        Defaulting to ``xy_only=True`` keeps the global height anchor and tends to reduce
+        long-horizon rollout drift/accumulated vertical bias when windows are stitched
+        autoregressively.
+        If ``yaw_only=True``, the frame-0 reference orientation is projected to yaw-only
+        before local-frame conversion, which avoids chaining pitch/roll in the stitched
+        reference frame and can reduce unnatural long-horizon tilting.
+
+        This function defines the local-frame convention used by training targets and
+        by rollout composition utilities.
+        """
+        device = trajectory.device
         root_pos = trajectory[..., :3]
-        root_pos_rel = root_pos - root_pos[..., 0:1, :]
+        if xy_only:
+            root_pos_rel = root_pos - root_pos[..., 0:1, :] * torch.tensor([1.0, 1.0, 0.0], device=device)
+        else:
+            root_pos_rel = root_pos - root_pos[..., 0:1, :]
         if self.rot6d:
             jstates = trajectory[..., 9:]
             root_rot6d = trajectory[..., 3:9]
             R = rot6d_to_matrix(root_rot6d)
-            R0 = R[..., 0:1, :, :]
+            if yaw_only:
+                R0 = yaw_matrix(R[..., 0:1, :, :])
+            else:
+                R0 = R[..., 0:1, :, :]
             R0_inv = R0.transpose(-1, -2)
             R_rel = torch.matmul(R0_inv, R)
             root_rot6d_rel = rot6d_from_matrix(R_rel)
@@ -274,6 +306,8 @@ class LAFAN1Dataset(Dataset):
             jstates = trajectory[..., 7:]
             root_wxyz = trajectory[..., 3:7]
             root_wxyz_0 = root_wxyz[..., 0:1, :]
+            if yaw_only:
+                root_wxyz_0 = yaw_quat(root_wxyz_0)
             root_wxyz_0_inv = quat_conjugate(root_wxyz_0).expand_as(root_wxyz)
             root_wxyz_rel = quat_mul(root_wxyz_0_inv, root_wxyz)
             root_pos_rel = quat_rotate(root_wxyz_0_inv, root_pos_rel)
@@ -285,6 +319,8 @@ class LAFAN1Dataset(Dataset):
         chunk_local: torch.Tensor,
         root_pos_ref: torch.Tensor,
         root_rot6d_ref: torch.Tensor,
+        xy_only: bool = True,
+        yaw_only: bool = False,
     ) -> torch.Tensor:
         """
         Map a chunk expressed **relative to its first frame** (same convention as
@@ -299,15 +335,31 @@ class LAFAN1Dataset(Dataset):
             ``(..., T, D)`` with root pos/rot6d relative to frame 0 of this chunk.
         root_pos_ref, root_rot6d_ref
             Global-encoding root pose at that chunk's frame 0, ``(..., 3)`` and ``(..., 6)``.
+        xy_only
+            Must match ``xy_only`` used by :meth:`make_relative`. With ``xy_only=True`` (default),
+            only x/y translation is anchored to frame 0.
+        yaw_only
+            Must match ``yaw_only`` used by :meth:`make_relative`. If ``True``, compose with
+            the yaw-only component of ``root_rot6d_ref``.
         """
         pos_l = chunk_local[..., :3]
         rot6d_l = chunk_local[..., 3:POSE_BASE_DIM]
         tail = chunk_local[..., POSE_BASE_DIM:]
-        R_ref = rot6d_to_matrix(root_rot6d_ref)
+        if yaw_only:
+            R_ref = yaw_matrix(rot6d_to_matrix(root_rot6d_ref))
+        else:
+            R_ref = rot6d_to_matrix(root_rot6d_ref)
         R_l = rot6d_to_matrix(rot6d_l)
+        root_pos_anchor = root_pos_ref.unsqueeze(-2)
+        if xy_only:
+            root_pos_anchor = root_pos_anchor * torch.tensor(
+                [1.0, 1.0, 0.0],
+                device=root_pos_ref.device,
+                dtype=root_pos_ref.dtype,
+            )
         pos_g = (
             torch.matmul(R_ref.unsqueeze(-3), pos_l.unsqueeze(-1)).squeeze(-1)
-            + root_pos_ref.unsqueeze(-2)
+            + root_pos_anchor
         )
         R_g = torch.matmul(R_ref.unsqueeze(-3), R_l)
         rot6d_g = rot6d_from_matrix(R_g)
