@@ -37,13 +37,13 @@ from gen_modeling.datasets.synthetic import (
 class Config:
     data_type: Literal[
         "swiss_roll", "moons", "gaussian_mixture", "checkerboard"
-    ] = "checkerboard"
-    ambient_dim: int = 16
+    ] = "moons"
+    ambient_dim: int = 32
     n_points: int = 2**16
     batch_size: int = 1024
     hidden_dim: int = 512
     seed: int = 42
-    train_steps: int = 6000
+    train_steps: int = 10_000
     lr: float = 5e-4
     sample_steps: int = 100
     sample_stepsize: float = 0.01
