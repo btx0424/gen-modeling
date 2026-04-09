@@ -3,7 +3,7 @@ Equilibrium Matching on LAFAN1-style robot trajectories.
 
 This is a scaffold example using the shared 1D conditional U-Net over sequences.
 Inputs and outputs have shape (B, T, C), matching ``LAFAN1Dataset`` windows.
-Conditioning is done by pinning the first ``k`` timesteps (``--cond-steps``); the model
+Conditioning is done by pinning the first ``k`` timesteps (see ``lafan1_config.SlidingWindowConfig``); the model
 is trained to match the flow field on later steps while keeping the prefix fixed.
 Each epoch, sliding-window rollouts are denormalized and saved as CSV under ``outputs/.../validation/``.
 """
@@ -13,7 +13,8 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -36,14 +37,17 @@ from gen_modeling.datasets.robotics import (
 from gen_modeling.modules import ConditionalUNet1D
 from gen_modeling.utils.optim import MuonAdamWWrapper
 
+_EXAMPLES_DIR = Path(__file__).resolve().parent
+if str(_EXAMPLES_DIR) not in sys.path:
+    sys.path.insert(0, str(_EXAMPLES_DIR))
+from lafan1_config import SlidingWindowConfig
+
 
 @dataclass
 class Config:
     data_root: str = "./data"
     robot: RobotName = "g1"
-    seq_len: int = 32
-    cond_steps: int = 4
-    stride: int = 1
+    sliding: SlidingWindowConfig = field(default_factory=SlidingWindowConfig)
     batch_size: int = 128
     base_channels: int = 128
     cond_dim: int = 256
@@ -58,9 +62,6 @@ class Config:
     sample_mu: float = 0.3
     num_plot_samples: int = 16
     num_plot_dims: int = 6
-    val_total_len: int = 128
-    val_window_stride: int | None = None
-    download: bool = True
     use_wandb: bool = True
 
 
@@ -177,22 +178,6 @@ class EqM(nn.Module):
         return x
 
 
-def _resolve_val_window_stride(config: Config) -> int:
-    k = config.cond_steps
-    max_stride = config.seq_len - k
-    if max_stride < 1:
-        raise ValueError(
-            f"Need seq_len ({config.seq_len}) > cond_steps ({k}) for sliding-window validation."
-        )
-    if config.val_window_stride is None:
-        return max_stride
-    if config.val_window_stride < 1 or config.val_window_stride > max_stride:
-        raise ValueError(
-            f"val_window_stride must be in [1, {max_stride}], got {config.val_window_stride}"
-        )
-    return config.val_window_stride
-
-
 @torch.no_grad()
 def save_validation_rollouts_csv(
     model: EqM,
@@ -208,11 +193,11 @@ def save_validation_rollouts_csv(
     in retargeting **qpos** layout (``xyzw`` quaternion + ``jpos``; no ``jvel``).
     """
     model.eval()
-    k = config.cond_steps
+    k = config.sliding.cond_steps
     n = min(config.num_plot_samples, reference_batch.shape[0])
     cond_prefix = reference_batch[:n, :k].to(device)
-    stride = _resolve_val_window_stride(config)
-    total_len = config.val_total_len
+    stride = config.sliding.val_window_stride
+    total_len = config.sliding.val_total_len
     traj = sliding_window_generate(
         model,
         dataset,
@@ -279,7 +264,7 @@ def sliding_window_generate(
         Increment of the window start ``ws`` after each sample (smaller => more overlap).
     """
     k = model.cond_steps
-    seq_len = config.seq_len
+    seq_len = config.sliding.seq_len
     if cond_prefix.ndim != 3 or cond_prefix.shape[1] != k:
         raise ValueError(
             f"cond_prefix must be (N, {k}, D), got {tuple(cond_prefix.shape)}"
@@ -385,14 +370,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="LAFAN1 EqM scaffold.")
     parser.add_argument("--data-root", type=str, default=Config.data_root)
     parser.add_argument("--robot", choices=["g1", "h1", "h1_2"], default=Config.robot)
-    parser.add_argument("--seq-len", type=int, default=Config.seq_len)
-    parser.add_argument(
-        "--cond-steps",
-        type=int,
-        default=Config.cond_steps,
-        help="Pin the first k timesteps of every window for training and sampling.",
-    )
-    parser.add_argument("--stride", type=int, default=Config.stride)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--base-channels", type=int, default=Config.base_channels)
     parser.add_argument("--cond-dim", type=int, default=Config.cond_dim)
@@ -412,19 +389,6 @@ def main() -> None:
     parser.add_argument("--num-plot-samples", type=int, default=Config.num_plot_samples)
     parser.add_argument("--num-plot-dims", type=int, default=Config.num_plot_dims)
     parser.add_argument(
-        "--val-total-len",
-        type=int,
-        default=Config.val_total_len,
-        help="Sliding-window validation rollout length (timesteps); CSV rows per rollout.",
-    )
-    parser.add_argument(
-        "--val-window-stride",
-        type=int,
-        default=None,
-        help="Stride between windows in validation (default: seq_len - cond_steps).",
-    )
-    parser.add_argument("--no-download", action="store_true", help="Require local CSV clips; do not fetch from HF.")
-    parser.add_argument(
         "--checkpoint",
         type=str,
         default=None,
@@ -440,9 +404,6 @@ def main() -> None:
     config = Config(
         data_root=args.data_root,
         robot=args.robot,
-        seq_len=args.seq_len,
-        cond_steps=args.cond_steps,
-        stride=args.stride,
         batch_size=args.batch_size,
         base_channels=args.base_channels,
         cond_dim=args.cond_dim,
@@ -457,16 +418,7 @@ def main() -> None:
         sample_mu=args.sample_mu,
         num_plot_samples=args.num_plot_samples,
         num_plot_dims=args.num_plot_dims,
-        val_total_len=args.val_total_len,
-        val_window_stride=args.val_window_stride,
-        download=not args.no_download,
     )
-    if not (1 <= config.cond_steps <= config.seq_len):
-        raise ValueError(f"Need 1 <= cond-steps <= seq-len; got cond_steps={config.cond_steps}, seq_len={config.seq_len}")
-    if config.val_total_len < config.cond_steps:
-        raise ValueError(
-            f"val_total_len ({config.val_total_len}) must be >= cond_steps ({config.cond_steps})"
-        )
 
     torch.set_num_threads(max(config.num_threads, 1))
     torch.manual_seed(config.seed)
@@ -476,9 +428,9 @@ def main() -> None:
     dataset = LAFAN1Dataset(
         root=config.data_root,
         robot=config.robot,
-        seq_len=config.seq_len,
-        stride=config.stride,
-        download=config.download,
+        seq_len=config.sliding.seq_len,
+        stride=config.sliding.stride,
+        download=True,
     )
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
     state_dim = dataset.state_dim
@@ -489,7 +441,7 @@ def main() -> None:
             base_channels=config.base_channels,
             cond_dim=config.cond_dim,
         ),
-        cond_steps=config.cond_steps,
+        cond_steps=config.sliding.cond_steps,
     ).to(device)
     if config.use_muon_adamw:
         optimizer = MuonAdamWWrapper([model], lr=config.lr)

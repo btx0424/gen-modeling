@@ -1,5 +1,9 @@
 """
 Flow Matching on LAFAN1-style robot trajectories.
+
+Each epoch, sliding-window rollouts are built from shared ``lafan1_config.SlidingWindowConfig``
+(``seq_len``, ``cond_steps``, ``stride``, ``val_total_len``, ``val_window_stride``), matching
+``EqM_lafan1.py``. CSV rollouts are written under ``outputs/.../validation/``.
 """
 
 from __future__ import annotations
@@ -7,17 +11,30 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
+
+_EXAMPLES_DIR = Path(__file__).resolve().parent
+if str(_EXAMPLES_DIR) not in sys.path:
+    sys.path.insert(0, str(_EXAMPLES_DIR))
+from lafan1_config import SlidingWindowConfig
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from jaxtyping import Float
+from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from gen_modeling.datasets.robotics import LAFAN1Dataset, RobotName
+from gen_modeling.datasets.robotics import (
+    LAFAN1Dataset,
+    POSE_BASE_DIM,
+    ROOT_ROT_OFFSET,
+    RobotName,
+)
 from gen_modeling.flow_matching import (
     LinearFlow,
     LossType,
@@ -33,8 +50,7 @@ from gen_modeling.utils.optim import MuonAdamWWrapper
 class Config:
     data_root: str = "./data"
     robot: RobotName = "g1"
-    seq_len: int = 32
-    stride: int = 1
+    sliding: SlidingWindowConfig = field(default_factory=SlidingWindowConfig)
     batch_size: int = 128
     base_channels: int = 128
     cond_dim: int = 256
@@ -47,7 +63,6 @@ class Config:
     t_eps: float = 1e-2
     sample_steps: int = 80
     num_plot_samples: int = 16
-    download: bool = True
     model_arch: ModelArch = "vanilla"
     pred_type: PredictionType = "v"
     loss_type: LossType = "v"
@@ -115,43 +130,127 @@ def _load_checkpoint(
 
 
 @torch.no_grad()
-def sample_and_save(
+def sliding_window_generate(
+    flow: LinearFlow,
+    dataset: LAFAN1Dataset,
+    config: Config,
+    device: torch.device,
+    cond_prefix: Float[Tensor, "batch cond dim"],
+    total_len: int,
+    window_stride: int,
+) -> Float[Tensor, "batch total dim"]:
+    """
+    Same contract as ``EqM_lafan1.sliding_window_generate``: stitch long trajectories in
+    physical (unnormalized) trajectory space using normalized windows and root-frame merge.
+    """
+    k = config.sliding.cond_steps
+    seq_len = config.sliding.seq_len
+    if cond_prefix.ndim != 3 or cond_prefix.shape[1] != k:
+        raise ValueError(
+            f"cond_prefix must be (N, {k}, D), got {tuple(cond_prefix.shape)}"
+        )
+    if total_len < k:
+        raise ValueError(f"total_len ({total_len}) must be >= cond_steps ({k})")
+    if window_stride < 1:
+        raise ValueError("window_stride must be >= 1")
+    max_stride = seq_len - k
+    if max_stride < 1:
+        raise ValueError(
+            f"Need seq_len ({seq_len}) > cond_steps ({k}) to slide the window; "
+            "got no room to generate beyond the pinned prefix."
+        )
+    if window_stride > max_stride:
+        raise ValueError(
+            f"window_stride ({window_stride}) must be <= seq_len - cond_steps ({max_stride}) "
+            "so the next prefix stays inside the previous generated segment."
+        )
+
+    dtype = next(flow.model.parameters()).dtype
+    n, _, dim = cond_prefix.shape
+    traj = torch.zeros(n, total_len, dim, device=device, dtype=dtype)
+    cond0 = dataset.make_relative(cond_prefix.to(device=device, dtype=dtype))
+    traj[:, :k] = cond0
+
+    ws = 0
+    while True:
+        if ws + k > total_len:
+            break
+        traj_ws = traj[:, ws : ws + k]
+        cond_local = dataset.normalize(dataset.make_relative(traj_ws))
+        root_pos_ref = traj[:, ws, :3]
+        root_rot6d_ref = traj[:, ws, ROOT_ROT_OFFSET:POSE_BASE_DIM]
+
+        chunk = flow.sample_cond_prefix(cond_local, device, config.sample_steps)
+        n_write = min(seq_len, total_len - ws)
+        chunk_phys = dataset.denormalize(chunk[:, :n_write])
+        chunk_merged_phys = dataset.accumulate_chunk_in_root_frame(
+            chunk_phys,
+            root_pos_ref,
+            root_rot6d_ref,
+        )
+        traj[:, ws : ws + n_write] = chunk_merged_phys
+        if ws + n_write >= total_len:
+            break
+        ws += window_stride
+        if ws >= total_len:
+            break
+    return traj
+
+
+@torch.no_grad()
+def save_validation_rollouts_csv(
     flow: LinearFlow,
     config: Config,
-    dataset: LAFAN1Dataset,
     device: torch.device,
+    reference_batch: Float[Tensor, "batch seq dim"],
+    dataset: LAFAN1Dataset,
     out_dir: Path,
     epoch: int,
 ) -> dict[str, float | int | str]:
-    samples = flow.sample(config.num_plot_samples, device, config.sample_steps).detach().cpu()
-    samples_phys = dataset.denormalize(samples)
+    flow.model.eval()
+    k = config.sliding.cond_steps
+    n = min(config.num_plot_samples, reference_batch.shape[0])
+    cond_prefix = reference_batch[:n, :k].to(device)
+    stride = config.sliding.val_window_stride
+    total_len = config.sliding.val_total_len
+    traj = sliding_window_generate(
+        flow,
+        dataset,
+        config,
+        device,
+        cond_prefix,
+        total_len,
+        stride,
+    )
+    traj_denorm = traj.detach().cpu()
 
-    sample_dir = out_dir / "validation" / f"epoch_{epoch:03d}"
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    for i in range(samples_phys.shape[0]):
-        csv_qpos = dataset.trajectory_to_lafan1_csv_qpos(samples_phys[i])
-        np.savetxt(sample_dir / f"rollout_{i:03d}.csv", csv_qpos.numpy(), delimiter=",", fmt="%.8f")
+    val_dir = out_dir / "validation" / f"epoch_{epoch:03d}"
+    val_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        csv_qpos = dataset.trajectory_to_lafan1_csv_qpos(traj_denorm[i])
+        arr = csv_qpos.numpy()
+        np.savetxt(val_dir / f"rollout_{i:03d}.csv", arr, delimiter=",", fmt="%.8f")
 
-    metrics: dict[str, float | int | str] = {
+    meta: dict[str, float | int | str] = {
         "epoch": epoch,
-        "num_rollouts": int(samples_phys.shape[0]),
-        "csv_dir": str(sample_dir),
-        "sample_mean": float(samples_phys.mean().item()),
-        "sample_std": float(samples_phys.std().item()),
-        "sample_min": float(samples_phys.min().item()),
-        "sample_max": float(samples_phys.max().item()),
+        "val_total_len": total_len,
+        "val_window_stride": stride,
+        "num_rollouts": n,
+        "csv_dir": str(val_dir),
+        "sample_mean": float(traj_denorm.mean().item()),
+        "sample_std": float(traj_denorm.std().item()),
+        "sample_min": float(traj_denorm.min().item()),
+        "sample_max": float(traj_denorm.max().item()),
     }
-    metrics.update(dataset.compute_metrics(samples_phys))
-    (out_dir / f"fm_lafan1_epoch_{epoch:03d}.json").write_text(json.dumps(metrics, indent=2))
-    return metrics
+    meta.update(dataset.compute_metrics(traj_denorm))
+    (out_dir / f"fm_lafan1_epoch_{epoch:03d}.json").write_text(json.dumps(meta, indent=2))
+    return meta
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="LAFAN1 Flow Matching.")
     parser.add_argument("--data-root", type=str, default=Config.data_root)
     parser.add_argument("--robot", choices=["g1", "h1", "h1_2"], default=Config.robot)
-    parser.add_argument("--seq-len", type=int, default=Config.seq_len)
-    parser.add_argument("--stride", type=int, default=Config.stride)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--base-channels", type=int, default=Config.base_channels)
     parser.add_argument("--cond-dim", type=int, default=Config.cond_dim)
@@ -167,7 +266,6 @@ def main() -> None:
     parser.add_argument("--model-arch", choices=["vanilla", "global_residual", "corrected_residual1", "corrected_residual2"], default=Config.model_arch)
     parser.add_argument("--pred-type", choices=["x", "eps", "v"], default=Config.pred_type)
     parser.add_argument("--loss-type", choices=["x", "eps", "v"], default=Config.loss_type)
-    parser.add_argument("--no-download", action="store_true", help="Require local CSV clips; do not fetch from HF.")
     parser.add_argument(
         "--checkpoint",
         type=str,
@@ -179,14 +277,11 @@ def main() -> None:
         action="store_true",
         help="Load weights, optimizer, and RNG from --checkpoint and continue.",
     )
-    parser.add_argument("--use-wandb", action="store_true", help="Enable W&B logging.")
     args = parser.parse_args()
 
     config = Config(
         data_root=args.data_root,
         robot=args.robot,
-        seq_len=args.seq_len,
-        stride=args.stride,
         batch_size=args.batch_size,
         base_channels=args.base_channels,
         cond_dim=args.cond_dim,
@@ -199,11 +294,9 @@ def main() -> None:
         t_eps=args.t_eps,
         sample_steps=args.sample_steps,
         num_plot_samples=args.num_plot_samples,
-        download=not args.no_download,
         model_arch=args.model_arch,
         pred_type=args.pred_type,
         loss_type=args.loss_type,
-        use_wandb=args.use_wandb,
     )
 
     torch.set_num_threads(max(config.num_threads, 1))
@@ -214,14 +307,14 @@ def main() -> None:
     dataset = LAFAN1Dataset(
         root=config.data_root,
         robot=config.robot,
-        seq_len=config.seq_len,
-        stride=config.stride,
-        download=config.download,
+        seq_len=config.sliding.seq_len,
+        stride=config.sliding.stride,
+        download=True,
     )
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
     state_dim = dataset.state_dim
 
-    model = build_model(config, state_dim, config.seq_len).to(device)
+    model = build_model(config, state_dim, config.sliding.seq_len).to(device)
     if config.use_muon_adamw:
         optimizer = MuonAdamWWrapper([model], lr=config.lr)
     else:
@@ -256,20 +349,34 @@ def main() -> None:
         start_epoch += 1
         print(f"Resumed from {checkpoint_path}; training from epoch {start_epoch}")
 
+    ref_final: torch.Tensor | None = None
     for epoch in range(start_epoch, config.train_epochs):
         model.train()
         pbar = tqdm(loader, desc=f"epoch {epoch}")
         losses: list[float] = []
+        reference_batch: torch.Tensor | None = None
+
         for batch, _meta in pbar:
+            if reference_batch is None:
+                reference_batch = batch.cpu()
             x = dataset.normalize(dataset.make_relative(batch.to(device)))
             optimizer.zero_grad(set_to_none=True)
-            loss = flow.compute_loss(x)
+            loss = flow.compute_loss(x, cond_steps=config.sliding.cond_steps)
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
             pbar.set_postfix(loss=f"{loss.item():.5f}")
 
-        metrics = sample_and_save(flow, config, dataset, device, out_dir, epoch)
+        assert reference_batch is not None
+        metrics = save_validation_rollouts_csv(
+            flow,
+            config,
+            device,
+            reference_batch,
+            dataset,
+            out_dir,
+            epoch,
+        )
         _save_checkpoint(
             checkpoint_path, epoch=epoch, model=model, optimizer=optimizer, config=config
         )
@@ -297,7 +404,19 @@ def main() -> None:
                     step=epoch,
                 )
 
-    final_meta = sample_and_save(flow, config, dataset, device, out_dir, config.train_epochs)
+        ref_final = reference_batch
+
+    if ref_final is None:
+        ref_final = next(iter(loader))[0].cpu()
+    final_meta = save_validation_rollouts_csv(
+        flow,
+        config,
+        device,
+        ref_final,
+        dataset,
+        out_dir,
+        config.train_epochs,
+    )
     (out_dir / "fm_metrics.json").write_text(json.dumps(final_meta, indent=2))
     if wandb_run is not None:
         wandb_run.log(
