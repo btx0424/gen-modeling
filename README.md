@@ -2,6 +2,23 @@
 
 Small generative modeling experiments in PyTorch, including energy-based models, equilibrium models, flow matching, image datasets, and LAFAN1 motion data.
 
+## Related Works
+
+### Generative Models
+
+- [Equilibrium Matching: Generative Modeling with Implicit Energy-Based Models
+](https://arxiv.org/abs/2510.02300)
+
+- [Is Noise Conditioning Necessary for Denoising Generative Models?
+](https://arxiv.org/abs/2502.13129)
+
+- [Back to Basics: Let Denoising Generative Models Denoise
+](https://arxiv.org/abs/2511.13720)
+
+- [Introduction to Flow Matching and Diffusion Models 2026
+](https://diffusion.csail.mit.edu/2026/)
+
+
 ## Setup
 
 ### Option 1: `conda`

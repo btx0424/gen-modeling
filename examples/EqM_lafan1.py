@@ -35,6 +35,11 @@ from gen_modeling.datasets.robotics import (
     RobotName,
 )
 from gen_modeling.modules import ConditionalUNet1D
+from gen_modeling.utils.checkpoint import (
+    load_training_checkpoint,
+    read_training_checkpoint_config,
+    save_training_checkpoint,
+)
 from gen_modeling.utils.optim import MuonAdamWWrapper
 
 _EXAMPLES_DIR = Path(__file__).resolve().parent
@@ -51,6 +56,7 @@ class Config:
     batch_size: int = 128
     base_channels: int = 128
     cond_dim: int = 256
+    time_conditioning: bool = False
     num_threads: int = 1
     seed: int = 42
     train_epochs: int = 50
@@ -60,6 +66,8 @@ class Config:
     sample_stepsize: float = 0.01
     sample_sampler: Literal["gd", "nag"] = "nag"
     sample_mu: float = 0.3
+    # Noise level schedule for time-conditional sampling (matches flow ``t_eps`` convention).
+    sample_t_eps: float = 1e-2
     num_plot_samples: int = 16
     num_plot_dims: int = 6
     use_wandb: bool = True
@@ -73,10 +81,17 @@ def eqm_ct(a: float = 0.8, grad_scale: float = 4.0):
 
 
 class TrajectoryEqMBackbone(nn.Module):
-    def __init__(self, input_dim: int, base_channels: int, cond_dim: int):
+    def __init__(
+        self,
+        input_dim: int,
+        base_channels: int,
+        cond_dim: int,
+        time_conditioning: bool = True,
+    ):
         super().__init__()
         self.input_dim = input_dim
         self.cond_dim = cond_dim
+        self.time_conditioning = time_conditioning
         self.unet = ConditionalUNet1D(
             input_dim=input_dim,
             output_dim=input_dim,
@@ -85,9 +100,14 @@ class TrajectoryEqMBackbone(nn.Module):
             cond_dim=cond_dim,
         )
 
-    def forward(self, x: Float[Tensor, "batch time dim"]) -> Float[Tensor, "batch time dim"]:
-        cond = torch.zeros(x.shape[0], self.cond_dim, device=x.device, dtype=x.dtype)
-        return self.unet(x, cond, t=None)
+    def forward(
+        self,
+        x: Float[Tensor, "batch time dim"],
+        t: Float[Tensor, "batch"] | None = None,
+    ) -> Float[Tensor, "batch time dim"]:
+        if self.time_conditioning:
+            return self.unet(x, t=t)
+        return self.unet(x)
 
 
 class EqM(nn.Module):
@@ -96,6 +116,7 @@ class EqM(nn.Module):
         if cond_steps < 1:
             raise ValueError("cond_steps must be >= 1")
         self.network = network
+        self.time_conditioning = network.time_conditioning
         self.cond_steps = cond_steps
         self.grad_magnitude = eqm_ct()
 
@@ -105,15 +126,15 @@ class EqM(nn.Module):
             raise ValueError(
                 f"sequence length {x1.shape[1]} is shorter than cond_steps={k}"
             )
-        expand_shape = (-1,) + (x1.ndim - 1) * (1,)
-        t = torch.rand(x1.shape[0], device=x1.device, dtype=x1.dtype).reshape(expand_shape)
+        t = torch.rand(x1.shape[0], device=x1.device, dtype=x1.dtype)
+        t_view = t.view(-1, 1, 1)
         x0 = torch.randn_like(x1)
-        xt = t * x1 + (1.0 - t) * x0
+        xt = t_view * x1 + (1.0 - t_view) * x0
         prefix = x1[:, :k]
         xt[:, :k] = prefix
-        target = (x1 - x0) * self.grad_magnitude(t)
+        target = (x1 - x0) * self.grad_magnitude(t).view(-1, 1, 1)
         target[:, :k] = 0.0
-        pred = self.network(xt)
+        pred = self.network(xt, t)
         pred[:, :k] = 0.0
         return ((pred - target) ** 2).mean()
 
@@ -126,6 +147,7 @@ class EqM(nn.Module):
         *,
         num_steps: int,
         stepsize: float,
+        t_eps: float = 1e-2,
     ) -> Float[Tensor, "batch seq dim"]:
         k = self.cond_steps
         dtype = next(self.parameters()).dtype
@@ -136,10 +158,14 @@ class EqM(nn.Module):
         num_samples = cond_prefix.shape[0]
         feat_dim = cond_prefix.shape[-1]
         cond_prefix = cond_prefix.to(device=device, dtype=dtype)
+        if num_steps < 1:
+            raise ValueError("num_steps must be >= 1")
         x = torch.randn(num_samples, seq_len, feat_dim, device=device, dtype=dtype)
         x[:, :k] = cond_prefix
-        for _ in range(num_steps):
-            update = self.network(x)
+        ts = torch.linspace(t_eps, 1.0 - t_eps, num_steps, device=device, dtype=dtype)
+        for t_scalar in ts:
+            t_batch = t_scalar.expand(num_samples,)
+            update = self.network(x, t_batch)
             update[:, :k] = 0.0
             x = x + stepsize * update
             x[:, :k] = cond_prefix
@@ -155,6 +181,7 @@ class EqM(nn.Module):
         num_steps: int,
         stepsize: float,
         mu: float,
+        t_eps: float = 1e-2,
     ) -> Float[Tensor, "batch seq dim"]:
         k = self.cond_steps
         dtype = next(self.parameters()).dtype
@@ -165,17 +192,36 @@ class EqM(nn.Module):
         num_samples = cond_prefix.shape[0]
         feat_dim = cond_prefix.shape[-1]
         cond_prefix = cond_prefix.to(device=device, dtype=dtype)
+        if num_steps < 1:
+            raise ValueError("num_steps must be >= 1")
         x = torch.randn(num_samples, seq_len, feat_dim, device=device, dtype=dtype)
         x[:, :k] = cond_prefix
         momentum = torch.zeros_like(x)
-        for _ in range(num_steps):
+        ts = torch.linspace(t_eps, 1.0 - t_eps, num_steps, device=device, dtype=dtype)
+        for t_scalar in ts:
+            t_batch = t_scalar.expand(num_samples,)
             lookahead = x + stepsize * mu * momentum
             lookahead[:, :k] = cond_prefix
-            momentum = self.network(lookahead)
+            momentum = self.network(lookahead, t_batch)
             momentum[:, :k] = 0.0
             x = x + stepsize * momentum
             x[:, :k] = cond_prefix
         return x
+
+
+def _assert_resume_compatible(checkpoint_path: Path, config: Config) -> None:
+    ckpt_config = read_training_checkpoint_config(checkpoint_path)
+    ckpt_time = ckpt_config.get("time_conditioning")
+    if ckpt_time is None:
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} is missing `time_conditioning`; refusing to resume "
+            "because the time-conditioning path materially changes model behavior."
+        )
+    if bool(ckpt_time) != config.time_conditioning:
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} was trained with time_conditioning={ckpt_time}, "
+            f"but current config requests time_conditioning={config.time_conditioning}."
+        )
 
 
 @torch.no_grad()
@@ -286,11 +332,9 @@ def sliding_window_generate(
         )
 
     sample_fn = model.sample_nag if config.sample_sampler == "nag" else model.sample_gd
-    kwargs = (
-        {"mu": config.sample_mu}
-        if config.sample_sampler == "nag"
-        else {}
-    )
+    kwargs: dict[str, float] = {"t_eps": config.sample_t_eps}
+    if config.sample_sampler == "nag":
+        kwargs["mu"] = config.sample_mu
     dtype = next(model.parameters()).dtype
     n, _, dim = cond_prefix.shape
     traj = torch.zeros(n, total_len, dim, device=device, dtype=dtype)
@@ -331,41 +375,6 @@ def sliding_window_generate(
     return traj
 
 
-def _save_checkpoint(
-    path: Path,
-    *,
-    epoch: int,
-    model: nn.Module,
-    optimizer: optim.Optimizer,
-    config: Config,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "epoch": epoch,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "config": dataclasses.asdict(config),
-        "torch_rng_state": torch.get_rng_state(),
-        "numpy_rng_state": np.random.get_state(),
-    }
-    torch.save(payload, path)
-
-
-def _load_checkpoint(
-    path: Path,
-    model: nn.Module,
-    optimizer: optim.Optimizer,
-) -> int:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(payload["model_state_dict"])
-    optimizer.load_state_dict(payload["optimizer_state_dict"])
-    if "torch_rng_state" in payload:
-        torch.set_rng_state(payload["torch_rng_state"].contiguous().cpu())
-    if "numpy_rng_state" in payload:
-        np.random.set_state(payload["numpy_rng_state"])
-    return int(payload["epoch"])
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="LAFAN1 EqM scaffold.")
     parser.add_argument("--data-root", type=str, default=Config.data_root)
@@ -373,6 +382,12 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--base-channels", type=int, default=Config.base_channels)
     parser.add_argument("--cond-dim", type=int, default=Config.cond_dim)
+    parser.add_argument(
+        "--time-conditioning",
+        action=argparse.BooleanOptionalAction,
+        default=Config.time_conditioning,
+        help="Enable scalar time conditioning in the trajectory U-Net.",
+    )
     parser.add_argument("--num-threads", type=int, default=Config.num_threads)
     parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--train-epochs", type=int, default=Config.train_epochs)
@@ -386,6 +401,12 @@ def main() -> None:
     parser.add_argument("--sample-stepsize", type=float, default=Config.sample_stepsize)
     parser.add_argument("--sample-sampler", choices=["gd", "nag"], default=Config.sample_sampler)
     parser.add_argument("--sample-mu", type=float, default=Config.sample_mu)
+    parser.add_argument(
+        "--sample-t-eps",
+        type=float,
+        default=Config.sample_t_eps,
+        help="Endpoints for the sampling-time schedule [t_eps, 1-t_eps] when time_conditioning is True.",
+    )
     parser.add_argument("--num-plot-samples", type=int, default=Config.num_plot_samples)
     parser.add_argument("--num-plot-dims", type=int, default=Config.num_plot_dims)
     parser.add_argument(
@@ -407,6 +428,7 @@ def main() -> None:
         batch_size=args.batch_size,
         base_channels=args.base_channels,
         cond_dim=args.cond_dim,
+        time_conditioning=args.time_conditioning,
         num_threads=args.num_threads,
         seed=args.seed,
         train_epochs=args.train_epochs,
@@ -416,6 +438,7 @@ def main() -> None:
         sample_stepsize=args.sample_stepsize,
         sample_sampler=args.sample_sampler,
         sample_mu=args.sample_mu,
+        sample_t_eps=args.sample_t_eps,
         num_plot_samples=args.num_plot_samples,
         num_plot_dims=args.num_plot_dims,
     )
@@ -440,6 +463,7 @@ def main() -> None:
             input_dim=state_dim,
             base_channels=config.base_channels,
             cond_dim=config.cond_dim,
+            time_conditioning=config.time_conditioning,
         ),
         cond_steps=config.sliding.cond_steps,
     ).to(device)
@@ -463,7 +487,8 @@ def main() -> None:
     if args.resume:
         if not checkpoint_path.is_file():
             raise FileNotFoundError(f"--resume requested but no checkpoint at {checkpoint_path}")
-        start_epoch = _load_checkpoint(checkpoint_path, model, optimizer)
+        _assert_resume_compatible(checkpoint_path, config)
+        start_epoch = load_training_checkpoint(checkpoint_path, model, optimizer)
         start_epoch += 1
         print(f"Resumed from {checkpoint_path}; training from epoch {start_epoch}")
 
@@ -493,7 +518,7 @@ def main() -> None:
             out_dir,
             epoch,
         )
-        _save_checkpoint(
+        save_training_checkpoint(
             checkpoint_path,
             epoch=epoch,
             model=model,

@@ -43,6 +43,11 @@ from gen_modeling.flow_matching import (
     prediction_wrapper_class,
 )
 from gen_modeling.modules import ConditionalUNet1D
+from gen_modeling.utils.checkpoint import (
+    load_training_checkpoint,
+    read_training_checkpoint_config,
+    save_training_checkpoint,
+)
 from gen_modeling.utils.optim import MuonAdamWWrapper
 
 
@@ -54,6 +59,7 @@ class Config:
     batch_size: int = 128
     base_channels: int = 128
     cond_dim: int = 256
+    time_conditioning: bool = True
     num_threads: int = 1
     seed: int = 42
     train_epochs: int = 50
@@ -70,10 +76,17 @@ class Config:
 
 
 class TrajectoryFlowBackbone(nn.Module):
-    def __init__(self, input_dim: int, base_channels: int, cond_dim: int):
+    def __init__(
+        self,
+        input_dim: int,
+        base_channels: int,
+        cond_dim: int,
+        time_conditioning: bool = True,
+    ):
         super().__init__()
         self.sample_shape = (None, input_dim)
         self.cond_dim = cond_dim
+        self.time_conditioning = time_conditioning
         self.unet = ConditionalUNet1D(
             input_dim=input_dim,
             output_dim=input_dim,
@@ -83,50 +96,36 @@ class TrajectoryFlowBackbone(nn.Module):
         )
 
     def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        cond = torch.zeros(x_t.shape[0], self.cond_dim, device=x_t.device, dtype=x_t.dtype)
-        return self.unet(x_t, cond, t)
+        if self.time_conditioning:
+            return self.unet(x_t, t=t)
+        return self.unet(x_t)
 
 
 def build_model(config: Config, state_dim: int, seq_len: int) -> nn.Module:
-    base_network = TrajectoryFlowBackbone(state_dim, config.base_channels, config.cond_dim)
+    base_network = TrajectoryFlowBackbone(
+        input_dim=state_dim,
+        base_channels=config.base_channels,
+        cond_dim=config.cond_dim,
+        time_conditioning=config.time_conditioning,
+    )
     base_network.sample_shape = (seq_len, state_dim)
     wrapper_cls = prediction_wrapper_class(config.model_arch)
     return wrapper_cls(base_network, config.pred_type)
 
 
-def _save_checkpoint(
-    path: Path,
-    *,
-    epoch: int,
-    model: nn.Module,
-    optimizer: optim.Optimizer,
-    config: Config,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "epoch": epoch,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "config": dataclasses.asdict(config),
-        "torch_rng_state": torch.get_rng_state(),
-        "numpy_rng_state": np.random.get_state(),
-    }
-    torch.save(payload, path)
-
-
-def _load_checkpoint(
-    path: Path,
-    model: nn.Module,
-    optimizer: optim.Optimizer,
-) -> int:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(payload["model_state_dict"])
-    optimizer.load_state_dict(payload["optimizer_state_dict"])
-    if "torch_rng_state" in payload:
-        torch.set_rng_state(payload["torch_rng_state"].contiguous().cpu())
-    if "numpy_rng_state" in payload:
-        np.random.set_state(payload["numpy_rng_state"])
-    return int(payload["epoch"])
+def _assert_resume_compatible(checkpoint_path: Path, config: Config) -> None:
+    ckpt_config = read_training_checkpoint_config(checkpoint_path)
+    ckpt_time = ckpt_config.get("time_conditioning")
+    if ckpt_time is None:
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} is missing `time_conditioning`; refusing to resume "
+            "because the time-conditioning path materially changes model behavior."
+        )
+    if bool(ckpt_time) != config.time_conditioning:
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} was trained with time_conditioning={ckpt_time}, "
+            f"but current config requests time_conditioning={config.time_conditioning}."
+        )
 
 
 @torch.no_grad()
@@ -254,6 +253,12 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--base-channels", type=int, default=Config.base_channels)
     parser.add_argument("--cond-dim", type=int, default=Config.cond_dim)
+    parser.add_argument(
+        "--time-conditioning",
+        action=argparse.BooleanOptionalAction,
+        default=Config.time_conditioning,
+        help="Enable scalar time conditioning in the trajectory U-Net.",
+    )
     parser.add_argument("--num-threads", type=int, default=Config.num_threads)
     parser.add_argument("--seed", type=int, default=Config.seed)
     parser.add_argument("--train-epochs", type=int, default=Config.train_epochs)
@@ -345,7 +350,8 @@ def main() -> None:
     if args.resume:
         if not checkpoint_path.is_file():
             raise FileNotFoundError(f"--resume requested but no checkpoint at {checkpoint_path}")
-        start_epoch = _load_checkpoint(checkpoint_path, model, optimizer)
+        _assert_resume_compatible(checkpoint_path, config)
+        start_epoch = load_training_checkpoint(checkpoint_path, model, optimizer)
         start_epoch += 1
         print(f"Resumed from {checkpoint_path}; training from epoch {start_epoch}")
 
@@ -377,7 +383,7 @@ def main() -> None:
             out_dir,
             epoch,
         )
-        _save_checkpoint(
+        save_training_checkpoint(
             checkpoint_path, epoch=epoch, model=model, optimizer=optimizer, config=config
         )
         if losses:

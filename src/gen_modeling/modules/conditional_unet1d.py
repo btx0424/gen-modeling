@@ -77,9 +77,10 @@ class ConditionalUNet1D(nn.Module):
     Conditional 1D U-Net for sequence generation.
 
     Inputs and outputs use shape ``(B, T, C)`` to match robotics trajectories.
-    Conditioning is a dense vector ``cond`` of shape ``(B, cond_dim)``. Optional
-    scalar time ``t`` is embedded and added to the condition, which makes this
-    suitable for diffusion / flow / EqM over trajectories.
+    Conditioning is an optional dense vector ``cond`` of shape ``(B, cond_dim)``.
+    Optional scalar time ``t`` is embedded through a separate path and added to
+    the residual conditioning signal, which makes this suitable for diffusion /
+    flow / EqM over trajectories.
     """
 
     def __init__(
@@ -140,19 +141,41 @@ class ConditionalUNet1D(nn.Module):
 
         init_conv1d_modules(self)
 
-    def _build_condition(self, cond: torch.Tensor, t: torch.Tensor | None) -> torch.Tensor:
-        if cond.dim() != 2 or cond.shape[1] != self.cond_dim:
-            raise ValueError(f"cond must have shape (B, {self.cond_dim}), got {tuple(cond.shape)}")
-        out = self.cond_proj(cond)
+    def _build_condition(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        cond: torch.Tensor | None,
+        t: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if cond is None:
+            out = torch.zeros(batch_size, self.cond_dim, device=device, dtype=dtype)
+        else:
+            if cond.dim() != 2 or cond.shape[0] != batch_size or cond.shape[1] != self.cond_dim:
+                raise ValueError(
+                    f"cond must have shape (B, {self.cond_dim}), got {tuple(cond.shape)}"
+                )
+            out = self.cond_proj(cond.to(device=device, dtype=dtype))
         if t is not None:
-            out = out + self.time_mlp(sinusoidal_time_embedding_1d(t, self.cond_dim).to(dtype=out.dtype))
+            if t.dim() != 1 or t.shape[0] != batch_size:
+                raise ValueError(f"t must have shape (B,), got {tuple(t.shape)}")
+            t_embed = sinusoidal_time_embedding_1d(t.to(device=device, dtype=dtype), self.cond_dim)
+            out = out + self.time_mlp(t_embed.to(dtype=dtype))
         return out
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor, t: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cond: torch.Tensor | None = None,
+        t: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if x.dim() != 3:
             raise ValueError(f"x must have shape (B, T, C), got {tuple(x.shape)}")
+        batch_size = x.shape[0]
+        device, dtype = x.device, x.dtype
         x = x.transpose(1, 2)
-        cond_vec = self._build_condition(cond, t)
+        cond_vec = self._build_condition(batch_size, device, dtype, cond, t)
 
         h = self.in_conv(x)
         skips: list[torch.Tensor] = []
