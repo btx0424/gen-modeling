@@ -11,9 +11,13 @@ frame: ``[x,y,z, vx,vy,vz, rot6d(6), jpos..., jvel...]``.
 from __future__ import annotations
 
 import bisect
+import hashlib
+import json
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
+
 from tqdm import tqdm
+import yaml
 
 import numpy as np
 import torch
@@ -55,6 +59,101 @@ def _lafan1_base_with_clips(root: Path, robot: RobotName) -> Path | None:
         if clip.is_dir() and any(clip.glob("*.csv")):
             return base
     return None
+
+
+_LAFAN1_NORM_STATS_CACHE_VERSION = 1
+
+_LAFAN1_NORM_STATS_KEYS = (
+    "_jpos_mean",
+    "_jpos_std",
+    "_jvel_mean",
+    "_jvel_std",
+    "_root_pos_mean",
+    "_root_pos_std",
+    "_root_lin_vel_mean",
+    "_root_lin_vel_std",
+)
+
+
+def _lafan1_norm_stats_fingerprint(
+    robot: RobotName,
+    seq_len: int,
+    stride: int,
+    fps: float,
+    rot6d: bool,
+    clip_paths: list[Path],
+) -> tuple[str, dict[str, Any]]:
+    """Stable hash over config + clip identity (name, size, mtime) for norm-stat caching."""
+    clips_meta: list[list[str | int]] = []
+    for p in clip_paths:
+        st = p.stat()
+        clips_meta.append([p.name, st.st_size, st.st_mtime_ns])
+    payload: dict[str, Any] = {
+        "cache_version": _LAFAN1_NORM_STATS_CACHE_VERSION,
+        "robot": robot,
+        "seq_len": seq_len,
+        "stride": stride,
+        "fps": fps,
+        "rot6d": rot6d,
+        "clips": clips_meta,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    digest = hashlib.sha256(raw).hexdigest()
+    return digest, payload
+
+
+def _try_load_lafan1_norm_stats_cache(
+    cache_path: Path,
+    expected_digest: str,
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor] | None:
+    if not cache_path.is_file():
+        return None
+    try:
+        text = cache_path.read_text(encoding="utf-8")
+        blob = yaml.safe_load(text)
+    except Exception:
+        return None
+    if not isinstance(blob, dict):
+        return None
+    if blob.get("digest") != expected_digest:
+        return None
+    if int(blob.get("cache_version", 0)) != _LAFAN1_NORM_STATS_CACHE_VERSION:
+        return None
+    raw_stats = blob.get("stats")
+    if not isinstance(raw_stats, dict):
+        return None
+    stats: dict[str, torch.Tensor] = {}
+    for k in _LAFAN1_NORM_STATS_KEYS:
+        row = raw_stats.get(k)
+        if not isinstance(row, list) or not row:
+            return None
+        if not all(isinstance(x, (int, float)) for x in row):
+            return None
+        stats[k] = torch.tensor(row, dtype=dtype)
+    return stats
+
+
+def _save_lafan1_norm_stats_cache(
+    cache_path: Path,
+    digest: str,
+    payload: dict[str, Any],
+    stats: dict[str, torch.Tensor],
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    stats_yaml: dict[str, list[float]] = {
+        k: v.detach().cpu().float().numpy().astype(np.float64).tolist() for k, v in stats.items()
+    }
+    blob: dict[str, Any] = {
+        "cache_version": _LAFAN1_NORM_STATS_CACHE_VERSION,
+        "digest": digest,
+        "payload": payload,
+        "stats": stats_yaml,
+    }
+    cache_path.write_text(
+        yaml.safe_dump(blob, sort_keys=False, default_flow_style=None, allow_unicode=False),
+        encoding="utf-8",
+    )
 
 
 def _ensure_lafan1_robot_files(root: Path, robot: RobotName, *, download: bool) -> None:
@@ -123,6 +222,11 @@ class LAFAN1Dataset(Dataset):
         If ``True`` (default), fetch missing ``{robot}/*.csv`` from Hugging Face
         (``lvhaidong/LAFAN1_Retargeting_Dataset``) into ``root``. If ``False``,
         ``root/<robot>`` must already contain CSV clips.
+    use_norm_stats_cache
+        If ``True`` (default), read/write cached joint / root linear norm statistics under
+        ``<robot>/.gen_modeling_cache/lafan1_norm_stats_<sha256>.yaml`` when ``robot``,
+        ``seq_len``, ``stride``, ``fps``, ``rot6d``, and on-disk clip files (name, size, mtime)
+        match a previous run.
     """
 
     QPOS_DIM: dict[RobotName, int] = {
@@ -141,7 +245,8 @@ class LAFAN1Dataset(Dataset):
         fps: float = 30.0,
         dtype: torch.dtype = torch.float32,
         download: bool = True,
-        rot6d: bool = True
+        rot6d: bool = True,
+        use_norm_stats_cache: bool = True,
     ) -> None:
         super().__init__()
         if seq_len < 1:
@@ -195,33 +300,71 @@ class LAFAN1Dataset(Dataset):
                 f"No windows of length {seq_len} in {clip_dir}; all clips are too short."
             )
 
-        lo = POSE_BASE_DIM
-        mid = lo + n_joints
-        all_frames = torch.cat(self._clips, dim=0)
-        jpos_block = all_frames[:, lo:mid]
-        jvel_block = all_frames[:, mid:]
-        eps = 1e-6
-        self._jpos_mean = jpos_block.mean(dim=0)
-        self._jpos_std = jpos_block.std(dim=0, correction=0).clamp_min(eps)
-        self._jvel_mean = jvel_block.mean(dim=0)
-        self._jvel_std = jvel_block.std(dim=0, correction=0).clamp_min(eps)
+        stats_digest, stats_payload = _lafan1_norm_stats_fingerprint(
+            robot, seq_len, stride, self.fps, rot6d, paths
+        )
+        cache_dir = clip_dir / ".gen_modeling_cache"
+        cache_path = cache_dir / f"lafan1_norm_stats_{stats_digest}.yaml"
 
-        rel_root_pos_rows: list[torch.Tensor] = []
-        rel_root_vel_rows: list[torch.Tensor] = []
-        for clip in tqdm(self._clips, desc="Computing statistics"):
-            t_rows = clip.shape[0]
-            for start in range(0, t_rows - seq_len + 1, stride):
-                chunk = clip[start : start + seq_len]
-                rel = self.make_relative(chunk)
-                pos, vel = rel[:, :ROOT_ROT_OFFSET].split([3, 3], dim=1)
-                rel_root_pos_rows.append(pos.reshape(-1, ROOT_POS_DIM))
-                rel_root_vel_rows.append(vel.reshape(-1, ROOT_LIN_VEL_DIM))
-        all_rel_root_pos = torch.cat(rel_root_pos_rows, dim=0)
-        all_rel_root_vel = torch.cat(rel_root_vel_rows, dim=0)
-        self._root_pos_mean = all_rel_root_pos.mean(dim=0)
-        self._root_pos_std = all_rel_root_pos.std(dim=0, correction=0).clamp_min(eps)
-        self._root_lin_vel_mean = all_rel_root_vel.mean(dim=0)
-        self._root_lin_vel_std = all_rel_root_vel.std(dim=0, correction=0).clamp_min(eps)
+        cached = None
+        if use_norm_stats_cache:
+            cached = _try_load_lafan1_norm_stats_cache(cache_path, stats_digest, dtype)
+
+        if cached is not None:
+            print(f"Loading cached statistics from {cache_path}")
+            self._jpos_mean = cached["_jpos_mean"]
+            self._jpos_std = cached["_jpos_std"]
+            self._jvel_mean = cached["_jvel_mean"]
+            self._jvel_std = cached["_jvel_std"]
+            self._root_pos_mean = cached["_root_pos_mean"]
+            self._root_pos_std = cached["_root_pos_std"]
+            self._root_lin_vel_mean = cached["_root_lin_vel_mean"]
+            self._root_lin_vel_std = cached["_root_lin_vel_std"]
+        else:
+            lo = POSE_BASE_DIM
+            mid = lo + n_joints
+            all_frames = torch.cat(self._clips, dim=0)
+            jpos_block = all_frames[:, lo:mid]
+            jvel_block = all_frames[:, mid:]
+            eps = 1e-6
+            self._jpos_mean = jpos_block.mean(dim=0)
+            self._jpos_std = jpos_block.std(dim=0, correction=0).clamp_min(eps)
+            self._jvel_mean = jvel_block.mean(dim=0)
+            self._jvel_std = jvel_block.std(dim=0, correction=0).clamp_min(eps)
+
+            rel_root_pos_rows: list[torch.Tensor] = []
+            rel_root_vel_rows: list[torch.Tensor] = []
+            for clip in tqdm(self._clips, desc="Computing statistics"):
+                t_rows = clip.shape[0]
+                for start in range(0, t_rows - seq_len + 1, stride):
+                    chunk = clip[start : start + seq_len]
+                    rel = self.make_relative(chunk)
+                    pos, vel = rel[:, :ROOT_ROT_OFFSET].split([3, 3], dim=1)
+                    rel_root_pos_rows.append(pos.reshape(-1, ROOT_POS_DIM))
+                    rel_root_vel_rows.append(vel.reshape(-1, ROOT_LIN_VEL_DIM))
+            all_rel_root_pos = torch.cat(rel_root_pos_rows, dim=0)
+            all_rel_root_vel = torch.cat(rel_root_vel_rows, dim=0)
+            self._root_pos_mean = all_rel_root_pos.mean(dim=0)
+            self._root_pos_std = all_rel_root_pos.std(dim=0, correction=0).clamp_min(eps)
+            self._root_lin_vel_mean = all_rel_root_vel.mean(dim=0)
+            self._root_lin_vel_std = all_rel_root_vel.std(dim=0, correction=0).clamp_min(eps)
+
+            if use_norm_stats_cache:
+                _save_lafan1_norm_stats_cache(
+                    cache_path,
+                    stats_digest,
+                    stats_payload,
+                    {
+                        "_jpos_mean": self._jpos_mean,
+                        "_jpos_std": self._jpos_std,
+                        "_jvel_mean": self._jvel_mean,
+                        "_jvel_std": self._jvel_std,
+                        "_root_pos_mean": self._root_pos_mean,
+                        "_root_pos_std": self._root_pos_std,
+                        "_root_lin_vel_mean": self._root_lin_vel_mean,
+                        "_root_lin_vel_std": self._root_lin_vel_std,
+                    },
+                )
 
         self._window_offsets: list[int] = [0]
         for w in windows_per_clip:
