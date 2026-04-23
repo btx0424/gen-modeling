@@ -167,6 +167,7 @@ class ConditionalUNet1D(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        *,
         cond: torch.Tensor | None = None,
         t: torch.Tensor | None = None,
     ) -> torch.Tensor:

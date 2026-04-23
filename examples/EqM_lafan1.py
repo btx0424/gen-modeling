@@ -16,7 +16,7 @@ import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 import numpy as np
 import torch
@@ -28,12 +28,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from gen_modeling.datasets.robotics import (
-    LAFAN1Dataset,
-    POSE_BASE_DIM,
-    ROOT_ROT_OFFSET,
-    RobotName,
-)
+from gen_modeling.datasets.robotics import LAFAN1Dataset, RobotName
 from gen_modeling.modules import ConditionalUNet1D
 from gen_modeling.utils.checkpoint import (
     load_training_checkpoint,
@@ -45,7 +40,7 @@ from gen_modeling.utils.optim import MuonAdamWWrapper
 _EXAMPLES_DIR = Path(__file__).resolve().parent
 if str(_EXAMPLES_DIR) not in sys.path:
     sys.path.insert(0, str(_EXAMPLES_DIR))
-from lafan1_config import SlidingWindowConfig
+from lafan1_config import SlidingWindowConfig, save_validation_rollouts_csv
 
 
 @dataclass
@@ -102,12 +97,17 @@ class TrajectoryEqMBackbone(nn.Module):
 
     def forward(
         self,
-        x: Float[Tensor, "batch time dim"],
+        x_t: Float[Tensor, "batch time dim"],
         t: Float[Tensor, "batch"] | None = None,
+        cond: Tensor | None = None,
     ) -> Float[Tensor, "batch time dim"]:
+        """U-Net on the trajectory; ``cond`` is unused (prefix is pinned outside)."""
+        _ = cond
         if self.time_conditioning:
-            return self.unet(x, t=t)
-        return self.unet(x)
+            if t is None:
+                raise ValueError("TrajectoryEqMBackbone: time_conditioning requires ``t``.")
+            return self.unet(x_t, cond=None, t=t)
+        return self.unet(x_t, cond=None, t=None)
 
 
 class EqM(nn.Module):
@@ -134,7 +134,7 @@ class EqM(nn.Module):
         xt[:, :k] = prefix
         target = (x1 - x0) * self.grad_magnitude(t).view(-1, 1, 1)
         target[:, :k] = 0.0
-        pred = self.network(xt, t)
+        pred = self.network(xt, t=t, cond=None)
         pred[:, :k] = 0.0
         return ((pred - target) ** 2).mean()
 
@@ -165,7 +165,7 @@ class EqM(nn.Module):
         ts = torch.linspace(t_eps, 1.0 - t_eps, num_steps, device=device, dtype=dtype)
         for t_scalar in ts:
             t_batch = t_scalar.expand(num_samples,)
-            update = self.network(x, t_batch)
+            update = self.network(x, t=t_batch, cond=None)
             update[:, :k] = 0.0
             x = x + stepsize * update
             x[:, :k] = cond_prefix
@@ -202,11 +202,35 @@ class EqM(nn.Module):
             t_batch = t_scalar.expand(num_samples,)
             lookahead = x + stepsize * mu * momentum
             lookahead[:, :k] = cond_prefix
-            momentum = self.network(lookahead, t_batch)
+            momentum = self.network(lookahead, t=t_batch, cond=None)
             momentum[:, :k] = 0.0
             x = x + stepsize * momentum
             x[:, :k] = cond_prefix
         return x
+
+
+def _eqm_validation_sample_chunk(
+    eqm: EqM,
+    config: Config,
+    device: torch.device,
+) -> Callable[[Tensor], Tensor]:
+    sample_fn = eqm.sample_nag if config.sample_sampler == "nag" else eqm.sample_gd
+    kwargs: dict[str, float] = {"t_eps": config.sample_t_eps}
+    if config.sample_sampler == "nag":
+        kwargs["mu"] = config.sample_mu
+    seq_len = config.sliding.seq_len
+
+    def sample_chunk(cond_local: Tensor) -> Tensor:
+        return sample_fn(
+            cond_prefix=cond_local,
+            seq_len=seq_len,
+            device=device,
+            num_steps=config.sample_steps,
+            stepsize=config.sample_stepsize,
+            **kwargs,
+        )
+
+    return sample_chunk
 
 
 def _assert_resume_compatible(checkpoint_path: Path, config: Config) -> None:
@@ -222,157 +246,6 @@ def _assert_resume_compatible(checkpoint_path: Path, config: Config) -> None:
             f"Checkpoint {checkpoint_path} was trained with time_conditioning={ckpt_time}, "
             f"but current config requests time_conditioning={config.time_conditioning}."
         )
-
-
-@torch.no_grad()
-def save_validation_rollouts_csv(
-    model: EqM,
-    config: Config,
-    device: torch.device,
-    reference_batch: Float[Tensor, "batch seq dim"],
-    dataset: LAFAN1Dataset,
-    out_dir: Path,
-    epoch: int,
-) -> dict[str, float | int | str]:
-    """
-    Sliding-window rollouts in physical trajectory space, then write one CSV per sample
-    in retargeting **qpos** layout (``xyzw`` quaternion + ``jpos``; no ``jvel``).
-    """
-    model.eval()
-    k = config.sliding.cond_steps
-    n = min(config.num_plot_samples, reference_batch.shape[0])
-    cond_prefix = reference_batch[:n, :k].to(device)
-    stride = config.sliding.val_window_stride
-    total_len = config.sliding.val_total_len
-    traj = sliding_window_generate(
-        model,
-        dataset,
-        config,
-        device,
-        cond_prefix,
-        total_len,
-        stride,
-    )
-    traj_denorm = traj.detach().cpu()
-
-    val_dir = out_dir / "validation" / f"epoch_{epoch:03d}"
-    val_dir.mkdir(parents=True, exist_ok=True)
-    for i in range(n):
-        csv_qpos = dataset.trajectory_to_lafan1_csv_qpos(traj_denorm[i])
-        arr = csv_qpos.numpy()
-        np.savetxt(val_dir / f"rollout_{i:03d}.csv", arr, delimiter=",", fmt="%.8f")
-
-    meta = {
-        "epoch": epoch,
-        "val_total_len": total_len,
-        "val_window_stride": stride,
-        "num_rollouts": n,
-        "csv_dir": str(val_dir),
-        "sample_mean": float(traj_denorm.mean().item()),
-        "sample_std": float(traj_denorm.std().item()),
-        "sample_min": float(traj_denorm.min().item()),
-        "sample_max": float(traj_denorm.max().item()),
-    }
-    meta.update(dataset.compute_metrics(traj_denorm))
-    metrics_path = out_dir / f"eqm_lafan1_epoch_{epoch:03d}.json"
-    metrics_path.write_text(json.dumps(meta, indent=2))
-    return meta
-
-
-@torch.no_grad()
-def sliding_window_generate(
-    model: EqM,
-    dataset: LAFAN1Dataset,
-    config: Config,
-    device: torch.device,
-    cond_prefix: Float[Tensor, "batch cond dim"],
-    total_len: int,
-    window_stride: int,
-) -> Float[Tensor, "batch total dim"]:
-    """
-    Generate a trajectory longer than ``seq_len`` by repeatedly sampling a length-``seq_len``
-    window and advancing the window start by ``window_stride`` frames.
-
-    The stitched ``traj`` is stored in physical trajectory space (unnormalized). Normalization
-    is applied only at the model boundary: right before calling ``sample_*`` with
-    ``cond_prefix``, and right after sampling to map generated chunks back to physical space.
-
-    Require ``window_stride <= seq_len - cond_steps`` so the next prefix always lies in
-    frames already filled by the previous chunk (standard non-gap overlap condition).
-
-    Parameters
-    ----------
-    cond_prefix
-        Shape ``(N, cond_steps, D)`` in physical trajectory space (unnormalized).
-    total_len
-        Target number of timesteps ``T`` (must be at least ``cond_steps``).
-    window_stride
-        Increment of the window start ``ws`` after each sample (smaller => more overlap).
-    """
-    k = model.cond_steps
-    seq_len = config.sliding.seq_len
-    if cond_prefix.ndim != 3 or cond_prefix.shape[1] != k:
-        raise ValueError(
-            f"cond_prefix must be (N, {k}, D), got {tuple(cond_prefix.shape)}"
-        )
-    if total_len < k:
-        raise ValueError(f"total_len ({total_len}) must be >= cond_steps ({k})")
-    if window_stride < 1:
-        raise ValueError("window_stride must be >= 1")
-    max_stride = seq_len - k
-    if max_stride < 1:
-        raise ValueError(
-            f"Need seq_len ({seq_len}) > cond_steps ({k}) to slide the window; "
-            "got no room to generate beyond the pinned prefix."
-        )
-    if window_stride > max_stride:
-        raise ValueError(
-            f"window_stride ({window_stride}) must be <= seq_len - cond_steps ({max_stride}) "
-            "so the next prefix stays inside the previous generated segment."
-        )
-
-    sample_fn = model.sample_nag if config.sample_sampler == "nag" else model.sample_gd
-    kwargs: dict[str, float] = {"t_eps": config.sample_t_eps}
-    if config.sample_sampler == "nag":
-        kwargs["mu"] = config.sample_mu
-    dtype = next(model.parameters()).dtype
-    n, _, dim = cond_prefix.shape
-    traj = torch.zeros(n, total_len, dim, device=device, dtype=dtype)
-    cond0 = dataset.make_relative(cond_prefix.to(device=device, dtype=dtype))
-    traj[:, :k] = cond0
-
-    ws = 0
-    while True:
-        if ws + k > total_len:
-            break
-        # traj and cond0 stay in physical space; only model inputs/outputs are normalized.
-        traj_ws = traj[:, ws : ws + k]
-        cond_local = dataset.normalize(dataset.make_relative(traj_ws))
-        root_pos_ref = traj[:, ws, :3]
-        root_rot6d_ref = traj[:, ws, ROOT_ROT_OFFSET:POSE_BASE_DIM]
-
-        chunk = sample_fn(
-            cond_prefix=cond_local,
-            seq_len=seq_len,
-            device=device,
-            num_steps=config.sample_steps,
-            stepsize=config.sample_stepsize,
-            **kwargs,
-        )
-        n_write = min(seq_len, total_len - ws)
-        chunk_phys = dataset.denormalize(chunk[:, :n_write])
-        chunk_merged_phys = dataset.accumulate_chunk_in_root_frame(
-            chunk_phys,
-            root_pos_ref,
-            root_rot6d_ref,
-        )
-        traj[:, ws : ws + n_write] = chunk_merged_phys
-        if ws + n_write >= total_len:
-            break
-        ws += window_stride
-        if ws >= total_len:
-            break
-    return traj
 
 
 def main() -> None:
@@ -492,6 +365,8 @@ def main() -> None:
         start_epoch += 1
         print(f"Resumed from {checkpoint_path}; training from epoch {start_epoch}")
 
+    val_dtype = next(model.parameters()).dtype
+    val_sample_chunk = _eqm_validation_sample_chunk(model, config, device)
     for epoch in range(start_epoch, config.train_epochs):
         model.train()
         pbar = tqdm(loader, desc=f"epoch {epoch}")
@@ -509,14 +384,19 @@ def main() -> None:
             losses.append(loss.item())
             pbar.set_postfix(loss=f"{loss.item():.5f}")
 
+        assert reference_batch is not None
         metrics = save_validation_rollouts_csv(
-            model,
-            config,
-            device,
-            reference_batch,
-            dataset,
-            out_dir,
-            epoch,
+            eval_module=model,
+            sliding=config.sliding,
+            num_plot_samples=config.num_plot_samples,
+            device=device,
+            reference_batch=reference_batch,
+            dataset=dataset,
+            out_dir=out_dir,
+            epoch=epoch,
+            metrics_name_prefix="eqm_lafan1",
+            sample_chunk=val_sample_chunk,
+            dtype=val_dtype,
         )
         save_training_checkpoint(
             checkpoint_path,
@@ -550,14 +430,19 @@ def main() -> None:
                 )
 
     ref_final = reference_batch
+    assert ref_final is not None
     final_meta = save_validation_rollouts_csv(
-        model,
-        config,
-        device,
-        ref_final,
-        dataset,
-        out_dir,
-        config.train_epochs,
+        eval_module=model,
+        sliding=config.sliding,
+        num_plot_samples=config.num_plot_samples,
+        device=device,
+        reference_batch=ref_final,
+        dataset=dataset,
+        out_dir=out_dir,
+        epoch=config.train_epochs,
+        metrics_name_prefix="eqm_lafan1",
+        sample_chunk=val_sample_chunk,
+        dtype=val_dtype,
     )
     (out_dir / "eqm_metrics.json").write_text(json.dumps(final_meta, indent=2))
     if wandb_run is not None:

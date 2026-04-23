@@ -60,7 +60,7 @@ class EqM(nn.Module):
         x0 = torch.randn_like(x1)
         xt = t * x1 + (1.0 - t) * x0
         target = (x1 - x0) * self.grad_magnitude(t)
-        pred = self.network(xt, y)
+        pred = self.network(xt, cond=y)
         return ((pred - target) ** 2).mean()
 
     @torch.inference_mode()
@@ -69,7 +69,7 @@ class EqM(nn.Module):
         num_samples = labels.shape[0]
         x = torch.randn((num_samples,) + self.sample_shape, device=device, dtype=dtype)
         for _ in range(num_steps):
-            x = x + stepsize * self.network(x, labels)
+            x = x + stepsize * self.network(x, cond=labels)
         return x
 
     @torch.inference_mode()
@@ -80,7 +80,7 @@ class EqM(nn.Module):
         momentum = torch.zeros_like(x)
         for _ in range(num_steps):
             lookahead = x + stepsize * mu * momentum
-            momentum = self.network(lookahead, labels)
+            momentum = self.network(lookahead, cond=labels)
             x = x + stepsize * momentum
         return x
 

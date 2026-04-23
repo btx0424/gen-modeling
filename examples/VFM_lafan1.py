@@ -1,9 +1,8 @@
 """
-Flow Matching on LAFAN1-style robot trajectories.
+Variational Flow Matching on LAFAN1-style robot trajectories.
 
-Each epoch, sliding-window rollouts are built from shared ``lafan1_config.SlidingWindowConfig``
-(``seq_len``, ``cond_steps``, ``stride``, ``val_total_len``, ``val_window_stride``), matching
-``EqM_lafan1.py``. CSV rollouts are written under ``outputs/.../validation/``.
+Sliding-window validation CSVs mirror ``FM_lafan1.py`` / ``EqM_lafan1.py`` (see
+``lafan1_config.SlidingWindowConfig``).
 """
 
 from __future__ import annotations
@@ -30,18 +29,14 @@ from tqdm import tqdm
 
 from gen_modeling.datasets.robotics import LAFAN1Dataset, RobotName
 from gen_modeling.flow_matching import (
-    LinearFlow,
     LossType,
     ModelArch,
     PredictionType,
+    VariationalFlow,
     prediction_wrapper,
 )
-from gen_modeling.modules import ConditionalUNet1D
-from gen_modeling.utils.checkpoint import (
-    load_training_checkpoint,
-    read_training_checkpoint_config,
-    save_training_checkpoint,
-)
+from gen_modeling.modules import ConditionalUNet1D, Encoder1D
+from gen_modeling.utils.checkpoint import read_training_checkpoint_config, save_training_checkpoint
 from gen_modeling.utils.optim import MuonAdamWWrapper
 
 
@@ -53,6 +48,7 @@ class Config:
     batch_size: int = 128
     base_channels: int = 128
     cond_dim: int = 256
+    encoder_num_downsample: int = 2
     time_conditioning: bool = True
     num_threads: int = 1
     seed: int = 42
@@ -69,14 +65,16 @@ class Config:
     use_wandb: bool = True
 
 
-class TrajectoryFlowBackbone(nn.Module):
+class TrajectoryVariationalBackbone(nn.Module):
+    """Conditional U-Net trajectory denoiser with latent ``cond`` (encoder output)."""
+
     def __init__(
         self,
         input_dim: int,
         base_channels: int,
         cond_dim: int,
         time_conditioning: bool = True,
-    ):
+    ) -> None:
         super().__init__()
         self.sample_shape = (None, input_dim)
         self.cond_dim = cond_dim
@@ -89,24 +87,23 @@ class TrajectoryFlowBackbone(nn.Module):
             cond_dim=cond_dim,
         )
 
-    def forward(
-        self, x_t: torch.Tensor, t: torch.Tensor, cond: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        _ = cond
+    def forward(self, x_t: torch.Tensor, t: Tensor, cond: Tensor | None = None) -> Tensor:
+        if cond is None:
+            raise ValueError("TrajectoryVariationalBackbone requires cond (latent z).")
         if self.time_conditioning:
-            return self.unet(x_t, cond=None, t=t)
-        return self.unet(x_t, cond=None, t=None)
+            return self.unet(x_t, cond=cond, t=t)
+        return self.unet(x_t, cond=cond, t=None)
 
 
 def build_model(config: Config, state_dim: int, seq_len: int) -> nn.Module:
-    base_network = TrajectoryFlowBackbone(
+    base = TrajectoryVariationalBackbone(
         input_dim=state_dim,
         base_channels=config.base_channels,
         cond_dim=config.cond_dim,
         time_conditioning=config.time_conditioning,
     )
-    base_network.sample_shape = (seq_len, state_dim)
-    return prediction_wrapper(base_network, config.pred_type, config.model_arch)
+    base.sample_shape = (seq_len, state_dim)
+    return prediction_wrapper(base, config.pred_type, config.model_arch)
 
 
 def _assert_resume_compatible(checkpoint_path: Path, config: Config) -> None:
@@ -124,18 +121,45 @@ def _assert_resume_compatible(checkpoint_path: Path, config: Config) -> None:
         )
 
 
+def load_vfm_checkpoint(
+    path: Path,
+    encoder: nn.Module,
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    *,
+    map_location: str | torch.device | None = "cpu",
+) -> int:
+    payload = torch.load(path, map_location=map_location, weights_only=False)
+    if "encoder_state_dict" not in payload:
+        raise ValueError(f"Checkpoint {path} is not a VFM checkpoint (missing encoder_state_dict).")
+    encoder.load_state_dict(payload["encoder_state_dict"])
+    model.load_state_dict(payload["model_state_dict"])
+    optimizer.load_state_dict(payload["optimizer_state_dict"])
+    if "torch_rng_state" in payload:
+        torch.set_rng_state(payload["torch_rng_state"].contiguous().cpu())
+    if "numpy_rng_state" in payload:
+        np.random.set_state(payload["numpy_rng_state"])
+    return int(payload["epoch"])
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="LAFAN1 Flow Matching.")
+    parser = argparse.ArgumentParser(description="LAFAN1 Variational Flow Matching.")
     parser.add_argument("--data-root", type=str, default=Config.data_root)
     parser.add_argument("--robot", choices=["g1", "h1", "h1_2"], default=Config.robot)
     parser.add_argument("--batch-size", type=int, default=Config.batch_size)
     parser.add_argument("--base-channels", type=int, default=Config.base_channels)
     parser.add_argument("--cond-dim", type=int, default=Config.cond_dim)
     parser.add_argument(
+        "--encoder-num-downsample",
+        type=int,
+        default=Config.encoder_num_downsample,
+        help="Encoder1D num_downsample (temporal stride-2 stages).",
+    )
+    parser.add_argument(
         "--time-conditioning",
         action=argparse.BooleanOptionalAction,
         default=Config.time_conditioning,
-        help="Enable scalar time conditioning in the trajectory U-Net.",
+        help="Pass scalar t into the trajectory U-Net.",
     )
     parser.add_argument("--num-threads", type=int, default=Config.num_threads)
     parser.add_argument("--seed", type=int, default=Config.seed)
@@ -146,19 +170,23 @@ def main() -> None:
     parser.add_argument("--t-eps", type=float, default=Config.t_eps)
     parser.add_argument("--sample-steps", type=int, default=Config.sample_steps)
     parser.add_argument("--num-plot-samples", type=int, default=Config.num_plot_samples)
-    parser.add_argument("--model-arch", choices=["vanilla", "global_residual", "corrected_residual1", "corrected_residual2"], default=Config.model_arch)
-    parser.add_argument("--pred-type", choices=["x", "eps", "v"], default=Config.pred_type)
-    parser.add_argument("--loss-type", choices=["x", "eps", "v"], default=Config.loss_type)
+    parser.add_argument(
+        "--model-arch",
+        choices=["vanilla", "global_residual", "corrected_residual1", "corrected_residual2"],
+        default=Config.model_arch,
+    )
+    parser.add_argument("--pred-type", choices=["v"], default=Config.pred_type)
+    parser.add_argument("--loss-type", choices=["v"], default=Config.loss_type)
     parser.add_argument(
         "--checkpoint",
         type=str,
         default=None,
-        help="Checkpoint .pt path (default: examples/outputs/FM_lafan1/checkpoint.pt).",
+        help="Checkpoint .pt path (default: examples/outputs/VFM_lafan1/checkpoint.pt).",
     )
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Load weights, optimizer, and RNG from --checkpoint and continue.",
+        help="Load encoder, flow model, optimizer, and RNG from --checkpoint and continue.",
     )
     args = parser.parse_args()
 
@@ -168,6 +196,8 @@ def main() -> None:
         batch_size=args.batch_size,
         base_channels=args.base_channels,
         cond_dim=args.cond_dim,
+        encoder_num_downsample=args.encoder_num_downsample,
+        time_conditioning=args.time_conditioning,
         num_threads=args.num_threads,
         seed=args.seed,
         train_epochs=args.train_epochs,
@@ -181,7 +211,6 @@ def main() -> None:
         pred_type=args.pred_type,
         loss_type=args.loss_type,
     )
-
     torch.set_num_threads(max(config.num_threads, 1))
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
@@ -197,17 +226,28 @@ def main() -> None:
     loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
     state_dim = dataset.state_dim
 
+    encoder = Encoder1D(
+        state_dim,
+        latent_dim=config.cond_dim,
+        hidden_channels=config.base_channels,
+        num_downsample=config.encoder_num_downsample,
+    ).to(device)
     model = build_model(config, state_dim, config.sliding.seq_len).to(device)
+
     if config.use_muon_adamw:
-        optimizer = MuonAdamWWrapper([model], lr=config.lr)
+        optimizer = MuonAdamWWrapper([encoder, model], lr=config.lr)
     else:
-        optimizer = optim.AdamW(model.parameters(), lr=config.lr)
-    flow = LinearFlow(
+        optimizer = optim.AdamW(
+            list(encoder.parameters()) + list(model.parameters()),
+            lr=config.lr,
+        )
+
+    flow = VariationalFlow(
+        encoder,
         model,
         noise_scale=config.noise_scale,
         loss_type=config.loss_type,
         t_eps=config.t_eps,
-        conditional=False,
     )
 
     wandb_run = None
@@ -216,11 +256,11 @@ def main() -> None:
 
         wandb_run = wandb.init(
             project="gen-modeling",
-            name="FM_lafan1",
+            name="VFM_lafan1",
             config=dataclasses.asdict(config),
         )
 
-    out_dir = Path(__file__).resolve().parent / "outputs" / "FM_lafan1"
+    out_dir = Path(__file__).resolve().parent / "outputs" / "VFM_lafan1"
     out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else out_dir / "checkpoint.pt"
 
@@ -229,15 +269,18 @@ def main() -> None:
         if not checkpoint_path.is_file():
             raise FileNotFoundError(f"--resume requested but no checkpoint at {checkpoint_path}")
         _assert_resume_compatible(checkpoint_path, config)
-        start_epoch = load_training_checkpoint(checkpoint_path, model, optimizer)
+        start_epoch = load_vfm_checkpoint(checkpoint_path, encoder, model, optimizer, map_location=device)
         start_epoch += 1
         print(f"Resumed from {checkpoint_path}; training from epoch {start_epoch}")
 
     ref_final: torch.Tensor | None = None
     for epoch in range(start_epoch, config.train_epochs):
+        encoder.train()
         model.train()
         pbar = tqdm(loader, desc=f"epoch {epoch}")
         losses: list[float] = []
+        fm_losses: list[float] = []
+        kl_losses: list[float] = []
         reference_batch: torch.Tensor | None = None
 
         for batch, _meta in pbar:
@@ -245,11 +288,13 @@ def main() -> None:
                 reference_batch = batch.cpu()
             x = dataset.normalize(dataset.make_relative(batch.to(device)))
             optimizer.zero_grad(set_to_none=True)
-            loss = flow.compute_loss(x, cond_steps=config.sliding.cond_steps)
+            loss, fm_loss, kl_loss = flow.compute_loss(x, cond_steps=config.sliding.cond_steps)
             loss.backward()
             optimizer.step()
             losses.append(loss.item())
-            pbar.set_postfix(loss=f"{loss.item():.5f}")
+            fm_losses.append(fm_loss.item())
+            kl_losses.append(kl_loss.item())
+            pbar.set_postfix(loss=f"{loss.item():.5f}", fm_loss=f"{fm_loss.item():.5f}", kl_loss=f"{kl_loss.item():.5f}")
 
         assert reference_batch is not None
         metrics = save_validation_rollouts_csv(
@@ -261,18 +306,27 @@ def main() -> None:
             dataset=dataset,
             out_dir=out_dir,
             epoch=epoch,
-            metrics_name_prefix="fm_lafan1",
+            metrics_name_prefix="vfm_lafan1",
             sample_chunk=lambda c: flow.sample_cond_prefix(c, device, config.sample_steps),
             dtype=next(flow.model.parameters()).dtype,
         )
         save_training_checkpoint(
-            checkpoint_path, epoch=epoch, model=model, optimizer=optimizer, config=config
+            checkpoint_path,
+            epoch=epoch,
+            model=model,
+            optimizer=optimizer,
+            config=config,
+            extra={"encoder_state_dict": encoder.state_dict()},
         )
         if losses:
             avg_loss = float(np.mean(losses))
+            avg_fm_loss = float(np.mean(fm_losses))
+            avg_kl_loss = float(np.mean(kl_losses))
             print(
                 f"epoch {epoch}: "
                 f"loss={avg_loss:.6f}, "
+                f"fm_loss={avg_fm_loss:.5f}, "
+                f"kl_loss={avg_kl_loss:.5f}, "
                 f"sample_std={metrics['sample_std']:.6f}, "
                 f"root_vel_fd_mse={metrics['root_vel_fd_mse']:.6f}, "
                 f"joint_vel_fd_mse={metrics['joint_vel_fd_mse']:.6f}"
@@ -281,6 +335,8 @@ def main() -> None:
                 wandb_run.log(
                     {
                         "train/loss": avg_loss,
+                        "train/fm_loss": avg_fm_loss,
+                        "train/kl_loss": avg_kl_loss,
                         "train/lr": float(optimizer.param_groups[0]["lr"]),
                         "val/sample_mean": float(metrics["sample_mean"]),
                         "val/sample_std": float(metrics["sample_std"]),
@@ -305,11 +361,11 @@ def main() -> None:
         dataset=dataset,
         out_dir=out_dir,
         epoch=config.train_epochs,
-        metrics_name_prefix="fm_lafan1",
+        metrics_name_prefix="vfm_lafan1",
         sample_chunk=lambda c: flow.sample_cond_prefix(c, device, config.sample_steps),
         dtype=next(flow.model.parameters()).dtype,
     )
-    (out_dir / "fm_metrics.json").write_text(json.dumps(final_meta, indent=2))
+    (out_dir / "vfm_metrics.json").write_text(json.dumps(final_meta, indent=2))
     if wandb_run is not None:
         wandb_run.log(
             {
@@ -324,7 +380,7 @@ def main() -> None:
         )
         if checkpoint_path.is_file():
             artifact = wandb.Artifact(
-                name=f"fm_lafan1_checkpoint_{wandb_run.id}",
+                name=f"vfm_lafan1_checkpoint_{wandb_run.id}",
                 type="model",
             )
             artifact.add_file(str(checkpoint_path), name="checkpoint.pt")
@@ -333,7 +389,7 @@ def main() -> None:
 
     print(json.dumps(final_meta, indent=2))
     print(f"Saved validation CSV rollouts under {out_dir / 'validation'}")
-    print(f"Latest summary: {out_dir / 'fm_metrics.json'}")
+    print(f"Latest summary: {out_dir / 'vfm_metrics.json'}")
 
 
 if __name__ == "__main__":

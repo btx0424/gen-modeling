@@ -36,8 +36,9 @@ class ConditionalUNet2D(nn.Module):
     Small class-conditional U-Net backbone for image generation experiments.
 
     Optional continuous time ``t`` is embedded (sinusoidal + MLP) and added to
-    the label embedding so every ``ConditionalResidualBlock2d`` gets FiLM from
+    the class embedding so every ``ConditionalResidualBlock2d`` gets FiLM from
     both class and time. Pass ``t=None`` for time-agnostic use (e.g. EqM).
+    ``cond`` is the class index tensor (same role as former ``y``).
     """
 
     def __init__(
@@ -94,38 +95,39 @@ class ConditionalUNet2D(nn.Module):
 
         init_conv_modules(self)
 
-    def _encode_labels(self, y: torch.Tensor | None, batch_size: int, device: torch.device) -> torch.Tensor:
-        if y is None:
-            y = torch.full((batch_size,), self.null_class_idx, device=device, dtype=torch.long)
-        return self.label_embedding(y)
+    def _encode_labels(self, cond: torch.Tensor | None, batch_size: int, device: torch.device) -> torch.Tensor:
+        if cond is None:
+            cond = torch.full((batch_size,), self.null_class_idx, device=device, dtype=torch.long)
+        return self.label_embedding(cond)
 
     def forward(
         self,
         x: torch.Tensor,
-        y: torch.Tensor | None,
+        *,
         t: torch.Tensor | None = None,
+        cond: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        cond = self._encode_labels(y, x.shape[0], x.device)
+        film = self._encode_labels(cond, x.shape[0], x.device)
         if t is not None:
             te = sinusoidal_time_embedding(t, self.cond_dim)
-            cond = cond + self.time_mlp(te.to(dtype=cond.dtype))
+            film = film + self.time_mlp(te.to(dtype=film.dtype))
         h = self.in_conv(x)
         skips: list[torch.Tensor] = []
         for idx, block in enumerate(self.down_blocks):
-            h = block(h, cond)
+            h = block(h, film)
             skips.append(h)
             if idx < len(self.downsamples):
                 h = self.downsamples[idx](h)
 
-        h = self.mid_block1(h, cond)
-        h = self.mid_block2(h, cond)
+        h = self.mid_block1(h, film)
+        h = self.mid_block2(h, film)
 
         for idx, block in enumerate(self.up_blocks):
             skip = skips.pop()
             if h.shape[-2:] != skip.shape[-2:]:
                 h = F.interpolate(h, size=skip.shape[-2:], mode="nearest")
             h = torch.cat([h, skip], dim=1)
-            h = block(h, cond)
+            h = block(h, film)
             if idx < len(self.upsamples):
                 h = self.upsamples[idx](h)
 

@@ -17,17 +17,9 @@ from gen_modeling.datasets.synthetic import (
     SwissRollDataset,
     SyntheticAmbientDataset,
 )
+from gen_modeling.flow_matching import LossType, ModelArch, PredictionType, PredictionWrapper
 
 torch.set_float32_matmul_precision("high")
-
-PredictionType = Literal["x", "eps", "v"]
-LossType = Literal["x", "eps", "v"]
-ModelArch = Literal[
-    "vanilla",
-    "global_residual",
-    "corrected_residual1",
-    "corrected_residual2",
-]
 
 
 @dataclass(frozen=True)
@@ -108,6 +100,7 @@ class DenoisingMLP(nn.Module):
         activation: nn.Module = nn.ReLU
     ):
         super().__init__()
+        self.sample_shape = (dim,)
         self.time_encoder = nn.Sequential(
             nn.Linear(1, 20),
             activation(),
@@ -124,56 +117,12 @@ class DenoisingMLP(nn.Module):
             nn.Linear(hidden_dim, dim),
         )
 
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x_t: torch.Tensor, t: torch.Tensor, cond: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        _ = cond
         t_emb = self.time_encoder(t)
         return self.net(torch.cat((x_t, t_emb), dim=-1))
-
-
-class PredictionWrapper(nn.Module):
-    def __init__(self, network: nn.Module, pred_type: PredictionType):
-        super().__init__()
-        self.network = network
-        self.pred_type = pred_type
-
-    def reparameterize(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
-
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        pred = self.reparameterize(x_t, t)
-        if self.pred_type == "x":
-            x1_hat = pred
-            v_hat = (x1_hat - x_t) / (1.0 - t)
-            eps_hat = (x_t - t * x1_hat) / (1.0 - t)
-        elif self.pred_type == "eps":
-            eps_hat = pred
-            v_hat = (x_t - eps_hat) / t
-            x1_hat = x_t + (1.0 - t) * v_hat
-        else:
-            v_hat = pred
-            x1_hat = x_t + (1.0 - t) * v_hat
-            eps_hat = x_t - t * v_hat
-        return x1_hat, v_hat, eps_hat
-
-
-class VanillaWrapper(PredictionWrapper):
-    def reparameterize(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        return self.network(x_t, t)
-
-
-class GlobalResidualWrapper(PredictionWrapper):
-    def reparameterize(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        return self.network(x_t, t) + x_t
-
-
-class CorrectedResidual1Wrapper(PredictionWrapper):
-    def reparameterize(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        return self.network(x_t, t) + x_t / (1.0 - t)
-
-
-class CorrectedResidual2Wrapper(PredictionWrapper):
-    def reparameterize(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        raw_pred = self.network(x_t, t)
-        return (t * raw_pred + x_t) / (1.0 - t)
 
 
 def build_model(
@@ -184,13 +133,7 @@ def build_model(
     device: torch.device,
 ) -> nn.Module:
     base_network = DenoisingMLP(ambient_dim, hidden_dim)
-    wrapper_cls = {
-        "vanilla": VanillaWrapper,
-        "global_residual": GlobalResidualWrapper,
-        "corrected_residual1": CorrectedResidual1Wrapper,
-        "corrected_residual2": CorrectedResidual2Wrapper,
-    }[model_arch]
-    return wrapper_cls(base_network, pred_type).to(device)
+    return PredictionWrapper(base_network, pred_type, model_arch).to(device)
 
 
 def compute_loss(

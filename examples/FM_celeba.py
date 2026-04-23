@@ -20,10 +20,10 @@ from tqdm import tqdm
 from gen_modeling.datasets.images import CelebADataset, ImageDatasetInfo, tensor_batch_to_display
 from gen_modeling.flow_matching import (
     LinearFlow,
+    LossType,
     ModelArch,
     PredictionType,
-    LossType,
-    prediction_wrapper_class,
+    prediction_wrapper,
 )
 from gen_modeling.modules import ConditionalUNet2D
 
@@ -59,14 +59,15 @@ class ImageFlowUNet(nn.Module):
             channel_mults=(1, 2, 4),
         )
 
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        return self.backbone(x_t, None, t)
+    def forward(
+        self, x_t: torch.Tensor, t: torch.Tensor, cond: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        return self.backbone(x_t, t=t, cond=cond)
 
 
 def build_model(config: Config, data_info: ImageDatasetInfo) -> nn.Module:
     base_network = ImageFlowUNet(config.base_channels, data_info)
-    wrapper_cls = prediction_wrapper_class(config.model_arch)
-    return wrapper_cls(base_network, config.pred_type)
+    return prediction_wrapper(base_network, config.pred_type, config.model_arch)
 
 
 def plot_image_grid(
